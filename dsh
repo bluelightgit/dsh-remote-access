@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# dsh quick launcher (Caddy edition).
+#
+#   dsh              start dsh locally (equivalent to `dsh web`, foreground)
+#   dsh --lan        ensure local dsh is up, start the Caddy https proxy,
+#                    print the LAN address
+#   dsh --lan-stop   stop the Caddy https proxy (local dsh keeps running)
+#   dsh --stop       stop the Caddy proxy AND the local dsh on :3081
+#   dsh <anything>   pass through to the real dsh CLI (e.g. `dsh web --help`)
+#
+# v2 (native Caddy): replaces the ais-nginx-dsh / ais-dsh-bridge docker pair,
+# no docker involved at all. Port layout:
+#   dsh (node)       127.0.0.1:3081  plain http, loopback only
+#   caddy            *:3080          https only, LAN entry (any Host on this
+#                                    port proxies to dsh, like the old nginx
+#                                    `server_name _`; plaintext is refused)
+# URL: https://<LAN_IP>:3080 — HTTPS only, no plaintext fallback.
+set -euo pipefail
+
+SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
+DEPLOY_DIR="$(dirname "$SCRIPT")"
+CADDY_DIR="$DEPLOY_DIR/caddy"
+CADDY_CONF="$CADDY_DIR/Caddyfile"
+CADDY_PID="$CADDY_DIR/caddy.pid"
+CADDY_LOG="$CADDY_DIR/caddy.log"
+CADDY_RUN_LOG="$CADDY_DIR/caddy-run.log"
+
+# The real dsh CLI (npm/npx install). Override with DSH_REAL_BIN; otherwise
+# find it in the npx cache. Caddy binary: default to the system one, override
+# with DSH_CADDY_BIN.
+if [ -n "${DSH_REAL_BIN:-}" ]; then
+    REAL_DSH="$DSH_REAL_BIN"
+else
+    REAL_DSH="$(ls -d "$HOME"/.npm/_npx/*/node_modules/.bin/dsh 2>/dev/null | head -1 || true)"
+fi
+if [ -z "$REAL_DSH" ] || [ ! -x "$REAL_DSH" ]; then
+    echo "[dsh] ERROR: real dsh CLI not found; set DSH_REAL_BIN to the npx-installed dsh" >&2
+    exit 1
+fi
+CADDY_BIN="${DSH_CADDY_BIN:-/usr/bin/caddy}"
+
+# External LAN endpoint (https). Local dsh bind port is separate so caddy can
+# own the external port on all interfaces. LAN_IP is auto-detected at startup
+# (env DSH_LAN_IP wins), so a router-restart IP change is picked up on the
+# next `dsh --lan`; gen-cert.sh then re-signs the cert for the new IP.
+detect_lan_ip() {
+    local ip
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+    if [ -z "$ip" ]; then
+        ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)' | head -1 || true)
+    fi
+    [ -n "$ip" ] || ip=127.0.0.1
+    echo "$ip"
+}
+
+LAN_IP="${DSH_LAN_IP:-$(detect_lan_ip)}"
+PORT="${DSH_PORT:-3080}"
+LOCAL_PORT="${DSH_LOCAL_PORT:-3081}"
+
+# Tailscale MagicDNS name (e.g. <hostname>.tail<tailnet>.ts.net): when
+# `tailscale serve` fronts dsh, the browser-trust fence sees that host in
+# the Host header and would 403 — declare it as a trusted host. Empty when
+# Tailscale is not running.
+ts_trusted_host() {
+    command -v tailscale >/dev/null 2>&1 || return 0
+    local name
+    name=$(tailscale status --json 2>/dev/null | python3 -c \
+        "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print((d.get('Self',{}).get('DNSName','') or '').rstrip('.'))
+except Exception: pass" 2>/dev/null || true)
+    [ -n "$name" ] && echo "--trusted-host $name"
+}
+TRUSTED_HOST_ARGS="$(ts_trusted_host)"
+
+is_local_up() {
+    curl -s --noproxy '*' -o /dev/null -m 2 "http://127.0.0.1:$LOCAL_PORT/"
+}
+
+is_https_up() {
+    curl -sk --noproxy '*' -o /dev/null -m 2 "https://$LAN_IP:$PORT/"
+}
+
+caddy_running() {
+    [ -f "$CADDY_PID" ] && [ -n "$(cat "$CADDY_PID" 2>/dev/null)" ] && \
+        kill -0 "$(cat "$CADDY_PID" 2>/dev/null)" 2>/dev/null
+}
+
+# One-time transition helper: the old docker-based proxy would still own
+# $LAN_IP:$PORT if it is running.
+remove_legacy_docker() {
+    command -v docker >/dev/null 2>&1 || return 0
+    if docker ps -a --format '{{.Names}}' | grep -qx ais-nginx-dsh; then
+        echo "[dsh] removing legacy docker proxy ais-nginx-dsh ..."
+        docker rm -f ais-nginx-dsh >/dev/null 2>&1 || true
+    fi
+    if docker ps -a --format '{{.Names}}' | grep -qx ais-dsh-bridge; then
+        echo "[dsh] removing legacy docker bridge ais-dsh-bridge ..."
+        docker rm -f ais-dsh-bridge >/dev/null 2>&1 || true
+    fi
+}
+
+caddy_start() {
+    remove_legacy_docker
+    if caddy_running; then
+        echo "[dsh] caddy proxy already running (pid $(cat "$CADDY_PID"))"
+        return 0
+    fi
+
+    echo "[dsh] starting caddy https proxy on $LAN_IP:$PORT ..."
+    rm -f "$CADDY_PID" "$CADDY_RUN_LOG"
+    # Keep caddy's own data/config out of $HOME; export the deploy root so
+    # the Caddyfile's {$DSH_DEPLOY_DIR} placeholders resolve.
+    DSH_DEPLOY_DIR="$DEPLOY_DIR" \
+    XDG_DATA_HOME="$CADDY_DIR/data" \
+    XDG_CONFIG_HOME="$CADDY_DIR/config" \
+        nohup "$CADDY_BIN" run --config "$CADDY_CONF" --adapter caddyfile \
+            >>"$CADDY_RUN_LOG" 2>&1 &
+    echo $! > "$CADDY_PID"
+    disown 2>/dev/null || true
+
+    for _ in $(seq 1 30); do
+        if is_https_up; then
+            echo "[dsh] caddy ready (pid $(cat "$CADDY_PID"))"
+            return 0
+        fi
+        if ! kill -0 "$(cat "$CADDY_PID")" 2>/dev/null; then
+            echo "[dsh] ERROR: caddy exited; see $CADDY_RUN_LOG" >&2
+            exit 1
+        fi
+        sleep 0.5
+    done
+    echo "[dsh] ERROR: https://$LAN_IP:$PORT/ not answering; see $CADDY_RUN_LOG" >&2
+    exit 1
+}
+
+caddy_stop() {
+    if caddy_running; then
+        local pid
+        pid="$(cat "$CADDY_PID" 2>/dev/null || true)"
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.25
+            done
+        fi
+        rm -f "$CADDY_PID"
+        echo "[dsh] caddy proxy stopped"
+    else
+        echo "[dsh] caddy proxy not running"
+    fi
+}
+
+lan_start() {
+    local started_here=0
+
+    if ! is_local_up; then
+        echo "[dsh] local dsh not running — starting in background on 127.0.0.1:$LOCAL_PORT (log: $DEPLOY_DIR/dsh-local.log)"
+        nohup "$REAL_DSH" web --port "$LOCAL_PORT" $TRUSTED_HOST_ARGS >"$DEPLOY_DIR/dsh-local.log" 2>&1 &
+        started_here=1
+        for _ in $(seq 1 30); do
+            is_local_up && break
+            sleep 1
+        done
+        if ! is_local_up; then
+            echo "[dsh] ERROR: dsh did not start; see $DEPLOY_DIR/dsh-local.log" >&2
+            exit 1
+        fi
+    fi
+
+    # Keep the TLS cert in step with the (possibly changed) LAN IP: gen-cert
+    # no-ops when the cert already covers the current IP; if it regenerated
+    # (exit 10) the running caddy must restart to load the new cert.
+    if "$DEPLOY_DIR/gen-cert.sh"; then
+        :
+    else
+        rc=$?
+        if [ "$rc" = 10 ]; then
+            echo "[dsh] TLS cert regenerated for $LAN_IP — restarting caddy"
+            caddy_stop
+        elif [ "$rc" != 0 ]; then
+            echo "[dsh] WARNING: cert regeneration failed ($rc); using existing cert" >&2
+        fi
+    fi
+
+    caddy_start
+
+    echo
+    echo "  dsh LAN:  https://$LAN_IP:$PORT/"
+    echo "  (LAN cert is signed by the local CA — install ~/.local/share/dsh-lan/caddy/certs/ca/ca.crt on devices to remove the browser warning; https only, plain http no longer served)"
+    echo
+    if [ "$started_here" = 1 ]; then
+        echo "[dsh] local dsh running in background; log: $DEPLOY_DIR/dsh-local.log"
+    else
+        echo "[dsh] existing local dsh detected; proxy attached"
+    fi
+}
+
+lan_stop() {
+    caddy_stop
+}
+
+stop_local_dsh() {
+    local pid
+    pid=$(ss -tlnp 2>/dev/null | grep "127.0.0.1:$LOCAL_PORT" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+    if [ -n "$pid" ]; then
+        kill "$pid" 2>/dev/null || true
+        echo "[dsh] stopped local dsh (pid $pid, port $LOCAL_PORT)"
+    else
+        echo "[dsh] no local dsh found on 127.0.0.1:$LOCAL_PORT"
+    fi
+}
+
+case "${1:-}" in
+    --lan)
+        lan_start
+        ;;
+    --lan-stop)
+        lan_stop
+        ;;
+    --stop)
+        # Stop the Caddy proxy first, then the local dsh on port $LOCAL_PORT.
+        lan_stop
+        stop_local_dsh
+        ;;
+    "")
+        if is_local_up; then
+            echo "[dsh] dsh already running at http://127.0.0.1:$LOCAL_PORT/ (use 'dsh --lan' to expose it)"
+            exit 0
+        fi
+        exec "$REAL_DSH" web --port "$LOCAL_PORT" $TRUSTED_HOST_ARGS
+        ;;
+    *)
+        exec "$REAL_DSH" "$@"
+        ;;
+esac

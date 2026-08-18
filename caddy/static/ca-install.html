@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>安装局域网 CA 证书</title>
+<style>
+  body{font:15px/1.7 system-ui,-apple-system,"Segoe UI",sans-serif;max-width:640px;margin:0 auto;padding:24px 16px;color:#2b2b2b;background:#fafafa}
+  h1{font-size:20px} h2{font-size:16px;margin-top:24px}
+  .card{background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:14px 16px;margin:10px 0}
+  .btn{display:inline-block;background:#e6a700;color:#fff;text-decoration:none;font-weight:600;padding:8px 16px;border-radius:6px;margin:6px 4px 0 0}
+  code{background:#f0f0f0;padding:1px 5px;border-radius:3px;font-size:0.9em}
+  .note{color:#777;font-size:13px}
+</style>
+</head>
+<body>
+<h1>安装局域网 CA 证书</h1>
+<p>本机（dsh）使用<b>本地 CA 签名</b>的 HTTPS 证书。把 CA 证书安装进设备的信任区后，
+浏览器将不再提示“不安全”，并且 IP 变化、证书续期都不需要重新安装。</p>
+<a class="btn" href="/ca.crt">下载证书 (ca.crt)</a>
+<div class="card"><h2>Windows</h2>下载文件 → 右键 → <b>安装证书</b> → 选择“本地计算机” →
+下一台 → 选“<b>将所有证书都放入下列存储</b>” → 浏览 → “<b>受信任的根证书颁发机构</b>” → 完成。</div>
+<div class="card"><h2>macOS</h2>双击 <code>ca.crt</code> → 钥匙串选“<b>系统</b>” → 点该证书 →
+“信任”展开设为“<b>始终信任</b>” → 输入密码确认。</div>
+<div class="card"><h2>iPhone / iPad</h2>用 Safari 打开本页顶部的「<b>下载证书</b>」链接
+(<code>https://&lt;本机地址&gt;:3080/ca.crt</code>)下载 →
+设置 → 通用 → <b>VPN 与设备管理</b> → 安装描述文件 → 再进入
+设置 → 通用 → 关于本机 → <b>证书信任设置</b> → 打开本证书的完全信任开关。</div>
+<div class="card"><h2>Android</h2>设置 → 安全 → 加密与凭据 → 安装证书 → <b>CA 证书</b> →
+选择下载的 <code>ca.crt</code>。（部分 Android 浏览器信任用户 CA 后仍有提示，可改用 Firefox/Edge，或在 Chrome 中访问网站并手动接受一次。）</div>
+<div class="card"><h2>Linux</h2>以 root 运行：<br>
+<code>sudo cp ca.crt /usr/local/share/ca-certificates/dsh-lan-ca.crt && sudo update-ca-certificates</code><br>
+Firefox 需另到 设置 → 隐私与安全 → 证书 → 查看证书 → 证书颁发机构 → 导入。</div>
+<p class="note">安装后回到 <a href="/">dsh</a> 页面刷新一次，顶部的黄色提示条会自动消失（检测到证书已信任）。若一直不消失，可能是服务器端 mDNS（avahi-daemon）未开启，提示条会退化为“始终显示并引导安装”。</p>
+</body>
+</html>

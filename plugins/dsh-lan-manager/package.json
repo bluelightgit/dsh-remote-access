@@ -1,0 +1,19 @@
+{
+  "name": "dsh-lan-manager",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-ui-slots"]
+    }
+  },
+  "description": "LAN exposure orchestration for dsh web: manages the native Caddy https proxy, the local-CA certificate, and optional Tailscale controls, with a JSON status/action HTTP surface and a settings-page UI."
+}
