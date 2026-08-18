@@ -33,34 +33,28 @@ import http from 'node:http'
 import https from 'node:https'
 import { fileURLToPath } from 'node:url'
 import { X509Certificate } from 'node:crypto'
-import z from 'schemastery'
 
 export const name = 'dsh-lan-manager'
 export const inject = ['webServer']
 
-export const Config = z.object({
-  // Deploy root: <dir>/caddy and <dir>/gen-cert.sh. Empty → derived from this
-  // file's location (<dir>/plugins/dsh-lan-manager → <dir>).
-  deployDir: z.string().default(''),
-  // External https port caddy listens on (default 3080).
-  port: z.number().default(3080),
-  // dsh's own loopback port this proxy fronts (default 3081).
-  localPort: z.number().default(3081),
-  // LAN IP for the printed URL and probes. Empty → auto-detect at runtime.
-  lanIp: z.string().default(''),
-  // Caddy binary name/path (default 'caddy' from PATH).
-  caddyBin: z.string().default('caddy'),
-  // Start the proxy when the plugin activates (default true).
-  autoStart: z.boolean().default(true),
-  // Expose tailscale controls (default true).
-  tailscale: z.boolean().default(true),
-  // Show the "install the CA" banner (default OFF; the setCertNotice action
-  // flips it at runtime and persists the choice).
-  certNotice: z.boolean().default(false),
-  // mDNS hostname used by the banner probe. Empty → <hostname>.local.
-  probeHost: z.string().default(''),
-  probePort: z.number().default(3080),
-})
+// No Config schema on purpose: the plugin imports nothing outside node's
+// built-ins, so it runs from any location without a node_modules of its own
+// (a schema would drag in schemastery, whose bare import resolves from the
+// plugin's real path — broken once the plugin lives outside the profile).
+// All defaults are applied in apply(); cordis passes the raw row config
+// through unchanged when a plugin exports no Config.
+const DEFAULTS = {
+  deployDir: '', // derived from this file's location
+  port: 3080,
+  localPort: 3081,
+  lanIp: '',
+  caddyBin: 'caddy',
+  autoStart: true,
+  tailscale: true,
+  certNotice: false,
+  probeHost: '',
+  probePort: 3080,
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -78,7 +72,10 @@ function detectIp() {
   return rfc1918 || ips[0] || '127.0.0.1'
 }
 
-export function apply(ctx, config) {
+export function apply(ctx, rawConfig) {
+  // Merge raw row config over portable defaults (no schema: cordis passes
+  // the raw config through unchanged).
+  const config = { ...DEFAULTS, ...(rawConfig || {}) }
   // Deploy root derived from this file's real location (symlinks resolved).
   const here = path.dirname(fileURLToPath(import.meta.url))
   const deployDir = config.deployDir || path.resolve(here, '..', '..')
