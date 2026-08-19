@@ -23,7 +23,7 @@ dsh plugin --profile web add dsh-lan-manager
 ```bash
 git clone <repo-url> dsh-lan
 cd dsh-lan
-./install.sh
+node install.js
 ./dsh --lan
 ```
 
@@ -92,6 +92,16 @@ Tailscale 客户端                       │
 - Tailscale 可选
 
 macOS 部分兼容，Windows 原生暂建议使用 WSL2。未安装 Caddy / Tailscale 时，设置页会给出安装引导。
+
+| 能力 | Linux | macOS | Windows |
+|---|---|---|---|
+| 插件与设置页 | ✅ | ✅ | ✅ |
+| `install.js` | ✅ | ✅ | ✅ |
+| Caddy 进程识别 | ✅ `/proc` | ✅ `ps` | ✅ PowerShell |
+| Caddy 启动/停止 | ✅ 信号 | ✅ 信号 | ⚠️ `taskkill`，待实测 |
+| 证书生成 | ✅ openssl | ✅ openssl | ❌ |
+| `dsh` 启动器 | ✅ | ⚠️ 需 bash | ❌ |
+| Tailscale | ✅ | ✅ | ⚠️ 依赖 tailscaled 服务与管理员权限 |
 
 ## License
 

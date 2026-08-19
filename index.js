@@ -285,6 +285,49 @@ export function apply(ctx, rawConfig) {
     return i !== -1 && args[i + 1] === caddyConf
   }
 
+  const isWindows = process.platform === 'win32'
+
+  const commandMatchesOurConfig = (command) => {
+    return isWindows ? command.toLowerCase().includes(caddyConf.toLowerCase()) : command.includes(caddyConf)
+  }
+
+  async function readProcessCommand(pid) {
+    if (isWindows) {
+      const r = await exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`])
+      return r.ok && r.output ? { command: r.output } : null
+    }
+    if (process.platform === 'linux') {
+      try {
+        const comm = (await fs.readFile(`/proc/${pid}/comm`, 'utf8')).trim()
+        const args = (await fs.readFile(`/proc/${pid}/cmdline`, 'utf8')).split('\0').filter(Boolean)
+        return { comm, args }
+      } catch {
+        return null
+      }
+    }
+    // macOS and other POSIX systems without /proc: ask ps.
+    const r = await exec('ps', ['-p', String(pid), '-o', 'command='])
+    return r.ok && r.output ? { command: r.output } : null
+  }
+
+  function readProcessCommandSync(pid) {
+    if (isWindows) {
+      const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`], { encoding: 'utf8', timeout: 3000 })
+      return r.status === 0 && r.stdout ? { command: r.stdout.trim() } : null
+    }
+    if (process.platform === 'linux') {
+      try {
+        const comm = readFileSync(`/proc/${pid}/comm`, 'utf8').trim()
+        const args = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean)
+        return { comm, args }
+      } catch {
+        return null
+      }
+    }
+    const r = spawnSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8', timeout: 3000 })
+    return r.status === 0 && r.stdout ? { command: r.stdout.trim() } : null
+  }
+
   /**
    * Process-identity check for the pidfile. Returns `ours: true` only when
    * the pid belongs to a caddy running OUR Caddyfile; user/system caddies
@@ -292,27 +335,26 @@ export function apply(ctx, rawConfig) {
    */
   async function identifyCaddy(pid) {
     if (!alive(pid)) return { ours: false, stale: true }
-    try {
-      const comm = (await fs.readFile(`/proc/${pid}/comm`, 'utf8')).trim()
-      if (comm !== 'caddy') return { ours: false, foreign: true }
-      const cmdline = (await fs.readFile(`/proc/${pid}/cmdline`, 'utf8')).split('\0').filter(Boolean)
-      return usesOurCaddyConfig(cmdline) ? { ours: true } : { ours: false, foreign: true }
-    } catch {
-      // Non-Linux or unreadable /proc: never guess before killing.
-      return { ours: false, unknown: true }
+    const info = await readProcessCommand(pid)
+    if (!info) return { ours: false, unknown: true }
+    if (info.args) {
+      if (info.comm !== 'caddy') return { ours: false, foreign: true }
+      return usesOurCaddyConfig(info.args) ? { ours: true } : { ours: false, foreign: true }
     }
+    if (!info.command.toLowerCase().includes('caddy')) return { ours: false, foreign: true }
+    return commandMatchesOurConfig(info.command) ? { ours: true } : { ours: false, foreign: true }
   }
 
   function identifyCaddySync(pid) {
     if (!alive(pid)) return { ours: false, stale: true }
-    try {
-      const comm = readFileSync(`/proc/${pid}/comm`, 'utf8').trim()
-      if (comm !== 'caddy') return { ours: false, foreign: true }
-      const cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean)
-      return usesOurCaddyConfig(cmdline) ? { ours: true } : { ours: false, foreign: true }
-    } catch {
-      return { ours: false, unknown: true }
+    const info = readProcessCommandSync(pid)
+    if (!info) return { ours: false, unknown: true }
+    if (info.args) {
+      if (info.comm !== 'caddy') return { ours: false, foreign: true }
+      return usesOurCaddyConfig(info.args) ? { ours: true } : { ours: false, foreign: true }
     }
+    if (!info.command.toLowerCase().includes('caddy')) return { ours: false, foreign: true }
+    return commandMatchesOurConfig(info.command) ? { ours: true } : { ours: false, foreign: true }
   }
 
   /** TLS-health probe of the https endpoint (accepts the local CA leaf). */
@@ -569,10 +611,23 @@ export function apply(ctx, rawConfig) {
   const weEnabledFunnel = { v: false }
   const spawnedCaddyPids = new Set()
 
-  async function stopCaddyPid(pid) {
+  const terminateProcess = (pid, force) => {
+    if (isWindows) {
+      const args = ['/PID', String(pid), '/T']
+      if (force) args.push('/F')
+      const r = spawnSync('taskkill', args, { encoding: 'utf8', timeout: 5000 })
+      return r.status === 0
+    }
     try {
-      process.kill(pid, 'SIGTERM')
+      process.kill(pid, force ? 'SIGKILL' : 'SIGTERM')
+      return true
     } catch {
+      return false
+    }
+  }
+
+  async function stopCaddyPid(pid) {
+    if (!terminateProcess(pid, false)) {
       return { ok: false, message: `cannot signal pid ${pid}` }
     }
     for (let i = 0; i < 40; i++) {
@@ -588,9 +643,7 @@ export function apply(ctx, rawConfig) {
     // or browser connection never closes. The Caddyfile sets grace_period 3s,
     // but keep SIGKILL as a final fallback so a config apply can always make
     // progress instead of leaving the proxy half-dead.
-    try {
-      process.kill(pid, 'SIGKILL')
-    } catch {
+    if (!terminateProcess(pid, true)) {
       return { ok: false, message: 'caddy did not exit and SIGKILL failed' }
     }
     for (let i = 0; i < 20; i++) {
@@ -641,11 +694,7 @@ export function apply(ctx, rawConfig) {
     // Children spawned by this plugin are ours by construction.
     for (const pid of [...spawnedCaddyPids]) {
       if (!alive(pid)) continue
-      try {
-        process.kill(pid, 'SIGTERM')
-      } catch {
-        /* best effort */
-      }
+      terminateProcess(pid, false)
     }
     const pid = readPidSync()
     if (!alive(pid)) return
@@ -654,11 +703,7 @@ export function apply(ctx, rawConfig) {
       log.info(`[lan-manager] leaving foreign/unverified caddy alone (pid ${pid})`)
       return
     }
-    try {
-      process.kill(pid, 'SIGTERM')
-    } catch {
-      /* best effort */
-    }
+    terminateProcess(pid, false)
   }
 
   const runTailscaleSync = (args) => {

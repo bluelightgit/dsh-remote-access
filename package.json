@@ -22,14 +22,14 @@
     }
   },
   "files": [
-    "index.js",
-    "client/client.js",
-    "caddy/Caddyfile",
-    "gen-cert.sh",
-    "install.sh",
-    "cordis.patch.yml",
+    "LICENSE",
     "README.md",
-    "LICENSE"
+    "caddy/Caddyfile",
+    "client/client.js",
+    "cordis.patch.yml",
+    "gen-cert.sh",
+    "index.js",
+    "install.js"
   ],
   "keywords": [
     "dsh",
