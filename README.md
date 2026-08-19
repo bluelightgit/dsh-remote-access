@@ -55,7 +55,9 @@ dsh-lan/
 
 ## 安全说明
 
-- `/lan.action` 是局域网可 POST 的裸接口(无鉴权);对外公网化前应加 token/前置认证。
+- `/lan.action` 受**每次启动轮换的令牌**保护:`X-Lan-Token` 头必须匹配 dsh 页面
+  (index) 里注入的 meta 令牌,否则 401。设置页自动携带,用户无感;局域网里的
+  脚本/扫描器无法匿名调用。`/lan.status.json` 保持只读开放。
 - 证书是本地 CA 签名:设备装 `caddy/certs/ca/ca.crt` 后浏览器不再警告;或走
   tailscale serve 用公网受信证书。
 - 本仓库的 `.gitignore` 已排除全部本地运行时产物(证书/密钥/日志/pid/状态),
@@ -64,4 +66,6 @@ dsh-lan/
 ## 开发
 
 - 插件源文件即运行时文件(profile 里是符号链接),改完重启 dsh 生效。
-- 验证:`curl http://127.0.0.1:3081/lan.status.json`、`curl -X POST .../lan.action`。
+- 验证:`curl http://127.0.0.1:3081/lan.status.json`;
+  写操作需带令牌(从页面 meta `dsh-lan-token` 取):
+  `curl -X POST -H 'x-lan-token: <token>' .../lan.action -d '{"action":"status"}'`。

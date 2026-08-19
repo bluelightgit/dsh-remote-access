@@ -32,7 +32,7 @@ import path from 'node:path'
 import http from 'node:http'
 import https from 'node:https'
 import { fileURLToPath } from 'node:url'
-import { X509Certificate } from 'node:crypto'
+import { X509Certificate, randomBytes } from 'node:crypto'
 
 export const name = 'dsh-lan-manager'
 export const inject = ['webServer']
@@ -550,6 +550,15 @@ export function apply(ctx, rawConfig) {
     applyNoticeTap()
   })()
 
+  // The per-boot action token, delivered to the browser only via the served
+  // index page (meta tag). Rotates on every dsh restart. Declared before the
+  // routes so no handler can observe it uninitialized.
+  const actionToken = randomBytes(24).toString('hex')
+  const tokenTap = ctx.webServer.tapIndex((html) => {
+    if (html.includes('name="dsh-lan-token"')) return html
+    return html.replace('</head>', `<meta name="dsh-lan-token" content="${actionToken}">\n</head>`)
+  })
+
   // ── HTTP surface ─────────────────────────────────────────────────────────
   const sendJson = (res, code, obj) => {
     const body = JSON.stringify(obj)
@@ -593,6 +602,13 @@ export function apply(ctx, rawConfig) {
           sendJson(res, 405, { ok: false, message: 'POST only' })
           return
         }
+        // Mutating surface is gated by the per-boot token injected into the
+        // served index.html — the settings page carries it automatically;
+        // anonymous LAN POSTs get 401.
+        if (req.headers['x-lan-token'] !== actionToken) {
+          sendJson(res, 401, { ok: false, message: 'unauthorized: missing or stale X-Lan-Token (refresh the dsh page)' })
+          return
+        }
         const body = await readBody(req)
         let out
         try {
@@ -618,6 +634,13 @@ export function apply(ctx, rawConfig) {
   log.info(`[lan-manager] active deployDir=${deployDir} port=${config.port}`)
 
   return () => {
+    if (tokenTap) {
+      try {
+        tokenTap()
+      } catch {
+        /* best effort */
+      }
+    }
     for (const d of disposers) {
       try {
         d()
