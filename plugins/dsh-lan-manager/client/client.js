@@ -28,6 +28,12 @@ window.__ModuleLoader__.load({
 			".dslm-code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;background:rgba(128,128,128,.1);border-radius:6px;padding:2px 6px;word-break:break-all;max-width:70%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
 			".dslm-copy{font-size:11px;cursor:pointer;border:none;background:none;color:var(--dsw-specific-accent,#3b82f6);text-decoration:underline;padding:0;flex:none}",
 			".dslm-link{font-size:12px;color:var(--dsw-specific-accent,#3b82f6);text-decoration:none}",
+			".dslm-mask{position:fixed;inset:0;background:var(--dsw-alias-bg-mask-1,rgba(0,0,0,.45));backdrop-filter:var(--dsw-mask-blur,blur(2px));z-index:2000;display:flex;align-items:center;justify-content:center;padding:20px}",
+			".dslm-panel{background:var(--dsw-alias-bg-layer-2,#fff);border:1px solid var(--dsw-alias-border-weak,rgba(128,128,128,.22));border-radius:16px;box-shadow:var(--dsw-shadow-lv3,0 8px 30px rgba(0,0,0,.2));width:min(600px,100%);max-height:82vh;overflow:auto;padding:16px 18px;display:flex;flex-direction:column;gap:10px}",
+			".dslm-panel h3{margin:0;font-size:15px;font-weight:600;color:var(--dsw-alias-label-primary,#222)}",
+			".dslm-step{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary,#222)}",
+			".dslm-cmd{display:flex;align-items:center;gap:8px;background:rgba(128,128,128,.08);border-radius:8px;padding:6px 10px}",
+			".dslm-cmd code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;flex:1;word-break:break-all;color:var(--dsw-alias-label-primary,#222)}",
 		].join("\n");
 		const tagId = "dsh-lan-manager/LanSection.css";
 		if (typeof document !== "undefined" && document.querySelector(`style[data-plugin-css="${tagId}"]`) === null) {
@@ -118,11 +124,37 @@ window.__ModuleLoader__.load({
 				),
 			);
 
+		const CmdRow = ({ cmd }) =>
+			h(
+				"div",
+				{ className: "dslm-cmd" },
+				h("code", null, cmd),
+				h("button", { className: "dslm-copy", onClick: () => copy(cmd) }, "复制"),
+			);
+
+		const Modal = ({ title, onClose, children }) =>
+			h(
+				"div",
+				{ className: "dslm-mask", onClick: onClose },
+				h(
+					"div",
+					{ className: "dslm-panel", onClick: (e) => e.stopPropagation() },
+					h("div", { className: "dslm-head" }, h("div", { className: "dslm-title" }, title)),
+					children,
+					h(
+						"div",
+						{ className: "dslm-actions" },
+						h("button", { className: "dslm-btn", onClick: onClose }, "关闭"),
+					),
+				),
+			);
+
 		// ── section ─────────────────────────────────────────────────────────
 		function LanSection() {
 			const [st, setSt] = react.useState(null);
 			const [busy, setBusy] = react.useState(false);
 			const [msg, setMsg] = react.useState("");
+			const [modal, setModal] = react.useState(null);
 
 			const refresh = react.useCallback(() => {
 				fetch("/lan.status.json", { cache: "no-store" })
@@ -204,6 +236,8 @@ window.__ModuleLoader__.load({
 								{ label: "停止", onClick: () => act("stop") },
 								{ label: "重启", onClick: () => act("restart") },
 								{ label: "重新生成证书", onClick: () => act("regenCert") },
+								{ label: "自动启动 " + (st.autoStart !== false ? "关" : "开"), onClick: () => act("setAutoStart", { on: st.autoStart === false }) },
+								{ label: "局域网访问不了?", onClick: () => setModal("fw") },
 							],
 						},
 					),
@@ -230,6 +264,7 @@ window.__ModuleLoader__.load({
 								{ label: "Serve 关", onClick: () => act("tailscaleServe", { serveOn: false }) },
 								{ label: "Funnel 开", onClick: () => act("tailscaleFunnel", { funnelOn: true }) },
 								{ label: "Funnel 关", onClick: () => act("tailscaleFunnel", { funnelOn: false }) },
+								{ label: "安装/授权流程", onClick: () => setModal("ts") },
 							],
 						},
 					),
@@ -245,10 +280,53 @@ window.__ModuleLoader__.load({
 						"div",
 						{ className: "dslm-actions" },
 						h("button", { className: "dslm-btn primary", disabled: busy, onClick: () => act("setCertNotice", { on: !notice.enabled }) }, notice.enabled ? "关闭提示" : "开启提示"),
+						h("button", { className: "dslm-btn", disabled: busy, onClick: () => setModal("ca") }, "安装流程"),
 						h("a", { className: "dslm-link", href: "/ca.crt", target: "_blank", rel: "noreferrer" }, "下载 CA 证书"),
-						h("a", { className: "dslm-link", href: "/ca-install.html", target: "_blank", rel: "noreferrer" }, "各设备安装说明"),
 					),
 				),
+
+				// ── 弹窗 ─────────────────────────────────────────────────
+				modal === "fw"
+					? h(
+							Modal,
+							{ title: "局域网无法访问?先放行防火墙", onClose: () => setModal(null) },
+							h("div", { className: "dslm-step" }, "本机是 WSL2,外部设备访问由 Windows 防火墙把关(当前默认拦截入站)。在 Windows 的<b>管理员 PowerShell</b> 中执行:"),
+							h(CmdRow, { cmd: "New-NetFirewallHyperVRule -Name \"dsh-lan-3080\" -DisplayName \"dsh LAN 3080\" -Direction Inbound -Protocol TCP -LocalPorts 3080 -Action Allow" }),
+							h("div", { className: "dslm-step" }, "旧系统没有该命令时,改用:"),
+							h(CmdRow, { cmd: "netsh advfirewall firewall add rule name=\"dsh-lan-3080\" dir=in action=allow protocol=TCP localport=3080" }),
+							h("div", { className: "dslm-step" }, "然后手机/其他设备访问 " + st.url + " 验证;若还不行,检查路由器是否开启了 AP 隔离。"),
+						)
+					: null,
+				modal === "ts"
+					? h(
+							Modal,
+							{ title: "Tailscale 安装与授权", onClose: () => setModal(null) },
+							h("div", { className: "dslm-step" }, "1. 安装(需要 sudo):"),
+							h(CmdRow, { cmd: "curl -fsSL https://tailscale.com/install.sh | sh" }),
+							h("div", { className: "dslm-step" }, "2. 登录并授权当前用户(会打印登录链接,浏览器认证一次,之后无需 sudo):"),
+							h(CmdRow, { cmd: "sudo tailscale up --operator=$USER" }),
+							h("div", { className: "dslm-step" }, "3. 开放 dsh(serve 模式,公网受信证书,设备零安装零警告):"),
+							h(CmdRow, { cmd: "tailscale serve --bg --https=443 3081" }),
+							h("div", { className: "dslm-step" }, "4. (可选)公开到公网:"),
+							h(CmdRow, { cmd: "tailscale funnel 3080" }),
+							h("div", { className: "dslm-step" }, "完成后点「连接」刷新状态;访问地址见上方「域名地址」。"),
+						)
+					: null,
+				modal === "ca"
+					? h(
+							Modal,
+							{ title: "CA 证书安装流程", onClose: () => setModal(null) },
+							h("div", { className: "dslm-step" }, "① 先下载证书(或让设备直接访问本页的 /ca.crt):"),
+							h(CmdRow, { cmd: "https://" + (st.lanIp || "") + ":" + st.port + "/ca.crt" }),
+							h("div", { className: "dslm-step" }, "② 按设备安装:"),
+							h("div", { className: "dslm-step" }, "Windows:双击 ca.crt → 安装证书 → 本地计算机 → 受信任的根证书颁发机构"),
+							h("div", { className: "dslm-step" }, "macOS:双击 → 钥匙串「系统」→ 信任设为「始终信任」"),
+							h("div", { className: "dslm-step" }, "iPhone/iPad:Safari 打开上方链接 → 设置 → VPN 与设备管理 → 安装 → 证书信任设置里打开开关"),
+							h("div", { className: "dslm-step" }, "Android:设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书"),
+							h("div", { className: "dslm-step" }, "Linux:复制到 /usr/local/share/ca-certificates/ 后 update-ca-certificates(Firefox 需另导入)"),
+							h("div", { className: "dslm-step" }, "装完后刷新页面,提示自动消失(也可在下方直接关掉提示功能)。"),
+						)
+					: null,
 			);
 		}
 

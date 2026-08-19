@@ -87,7 +87,21 @@ export function apply(ctx, rawConfig) {
   const caFile = path.join(caddyDir, 'certs', 'ca', 'ca.crt')
   const genCert = path.join(deployDir, 'gen-cert.sh')
   const noticeStateFile = path.join(caddyDir, 'cert-notice.json')
+  const lanStateFile = path.join(caddyDir, 'lan-state.json')
   const log = ctx.logger
+
+  // Runtime-toggled settings (autoStart): persisted so the settings page can
+  // change them without editing cordis.patch.yml. Effective value = state
+  // file first, then row config, then defaults.
+  let autoStart = config.autoStart
+  void (async () => {
+    try {
+      const saved = JSON.parse(await fs.readFile(lanStateFile, 'utf8'))
+      if (typeof saved.autoStart === 'boolean') autoStart = saved.autoStart
+    } catch {
+      /* first run */
+    }
+  })()
 
   const readPid = async () => {
     try {
@@ -273,7 +287,7 @@ export function apply(ctx, rawConfig) {
       url: `https://${ip}:${config.port}/`,
       port: config.port,
       dshLocalPort: config.localPort,
-      autoStart: config.autoStart,
+      autoStart,
       caddy: { ...caddy, config: caddyConf, healthy: caddy.running ? await healthy() : false },
       cert: await certInfo(),
       mdns: await mdnsStatus(),
@@ -406,6 +420,13 @@ export function apply(ctx, rawConfig) {
           .then(() => fs.writeFile(noticeStateFile, JSON.stringify(noticeState, null, 2)))
         applyNoticeTap()
         return { ok: true, message: `证书安装提示已${noticeState.enabled ? '开启' : '关闭'}` }
+      }
+      case 'setAutoStart': {
+        autoStart = body.on === true
+        await fs
+          .mkdir(caddyDir, { recursive: true })
+          .then(() => fs.writeFile(lanStateFile, JSON.stringify({ autoStart }, null, 2)))
+        return { ok: true, message: `自动启动已${autoStart ? '开启' : '关闭'}(下次启动 dsh 生效)` }
       }
       case 'autoConfig': {
         // One-click bring-up: cert, Caddyfile template, then start the proxy.
@@ -632,7 +653,7 @@ export function apply(ctx, rawConfig) {
   )
 
   // ── auto-start ───────────────────────────────────────────────────────────
-  if (config.autoStart) {
+  if (autoStart) {
     setTimeout(() => {
       start()
         .then((r) =>

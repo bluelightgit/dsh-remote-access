@@ -63,6 +63,15 @@ dsh-lan/
 - 本仓库的 `.gitignore` 已排除全部本地运行时产物(证书/密钥/日志/pid/状态),
   commit 中不含任何机器数据。
 
+## 常见问题
+
+- **局域网其他设备访问不了?** 若部署在 WSL2(mirrored 模式),入站流量由
+  Windows(Hyper-V)防火墙把关,默认拦截。在 Windows 管理员 PowerShell 执行:
+  `New-NetFirewallHyperVRule -Name "dsh-lan-3080" -DisplayName "dsh LAN 3080" -Direction Inbound -Protocol TCP -LocalPorts 3080 -Action Allow`
+  (旧系统用 `netsh advfirewall firewall add rule name="dsh-lan-3080" dir=in action=allow protocol=TCP localport=3080`)。
+- **`autoStart`**:设置页「局域网(反代)」卡可切换,写入 `caddy/lan-state.json`,
+  下次启动 dsh 生效;也可直接改 `cordis.patch.yml` 里的 `autoStart`。
+
 ## 开发
 
 - 插件源文件即运行时文件(profile 里是符号链接),改完重启 dsh 生效。
