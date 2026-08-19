@@ -25,7 +25,6 @@
     "index.js",
     "client/client.js",
     "caddy/Caddyfile",
-    "caddy/static/ca-install.html",
     "gen-cert.sh",
     "install.sh",
     "cordis.patch.yml",

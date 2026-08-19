@@ -200,10 +200,6 @@ export function apply(ctx, rawConfig) {
       '\t\theader Content-Type "application/x-x509-ca-cert"',
       '\t\tfile_server',
       '\t}',
-      '\thandle /ca-install.html {',
-      '\t\troot * {$DSH_DEPLOY_DIR}/caddy/static',
-      '\t\tfile_server',
-      '\t}',
       '',
       '\thandle {',
       ...lanAuthLines,
@@ -1009,13 +1005,11 @@ export function apply(ctx, rawConfig) {
     zh: {
       text: "<b>安全连接未验证</b>：安装本机局域网证书后，此提示不再出现，浏览器也不会再报警“不安全”。",
       download: "下载证书",
-      guide: "安装说明",
       dismiss: "稍后再说"
     },
     en: {
       text: "<b>Secure connection not verified</b>: install this machine's LAN certificate and this notice disappears; the browser will no longer warn about the connection.",
       download: "Download certificate",
-      guide: "Install guide",
       dismiss: "Later"
     }
   };
@@ -1027,7 +1021,6 @@ export function apply(ctx, rawConfig) {
     b.innerHTML =
       "<span>" + m.text + "</span>" +
       '<a href="/ca.crt" style="background:#e6a700;color:#fff;text-decoration:none;padding:4px 10px;border-radius:4px;font-weight:600">' + m.download + '</a>' +
-      '<a href="/ca-install.html" style="color:#7a5b00">' + m.guide + '</a>' +
       '<button type="button" style="background:none;border:none;color:#7a5b00;cursor:pointer;font-size:12px" data-act="dismiss">' + m.dismiss + '</button>';
   }
   function probe() {

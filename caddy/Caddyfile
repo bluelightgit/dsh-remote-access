@@ -27,10 +27,6 @@ root * {$DSH_CADDY_DIR}/certs/ca
 header Content-Type "application/x-x509-ca-cert"
 file_server
 }
-handle /ca-install.html {
-root * {$DSH_DEPLOY_DIR}/caddy/static
-file_server
-}
 
 handle {
 reverse_proxy 127.0.0.1:{$DSH_LOCAL_PORT} {

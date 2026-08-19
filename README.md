@@ -83,7 +83,7 @@ Tailscale 客户端                       │
 
 - Basic Auth 使用 bcrypt hash，不保存明文密码。
 - Funnel 是公网入口，至少强制 Basic Auth；正式公网使用建议再叠加限流、限时和审计。
-- `/ca.crt` 和 `/ca-install.html` 保持免认证，便于设备首次安装证书。
+- `/ca.crt` 保持免认证，便于设备首次安装证书。
 
 ## 依赖与平台
 
