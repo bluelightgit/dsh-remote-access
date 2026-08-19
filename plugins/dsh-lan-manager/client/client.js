@@ -34,6 +34,13 @@ window.__ModuleLoader__.load({
 			".dslm-step{font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary,#222)}",
 			".dslm-cmd{display:flex;align-items:center;gap:8px;background:rgba(128,128,128,.08);border-radius:8px;padding:6px 10px}",
 			".dslm-cmd code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;flex:1;word-break:break-all;color:var(--dsw-alias-label-primary,#222)}",
+			".dslm-switch{position:relative;width:36px;height:20px;border-radius:10px;border:none;cursor:pointer;background:rgba(128,128,128,.32);transition:background .15s;flex:none;padding:0}",
+			".dslm-switch.on{background:var(--dsw-specific-accent,#3b82f6)}",
+			".dslm-switch::after{content:\"\";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:left .15s}",
+			".dslm-switch.on::after{left:18px}",
+			".dslm-switch:disabled{opacity:.5;cursor:not-allowed}",
+			".dslm-togrow{display:flex;align-items:center;gap:8px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary,#222);min-height:24px}",
+			".dslm-togrow .dslm-hint{flex:1;text-align:right;color:var(--dsw-alias-label-secondary,#666);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
 		].join("\n");
 		const tagId = "dsh-lan-manager/LanSection.css";
 		if (typeof document !== "undefined" && document.querySelector(`style[data-plugin-css="${tagId}"]`) === null) {
@@ -93,8 +100,28 @@ window.__ModuleLoader__.load({
 				h(
 					"span",
 					{ className: "dslm-detail" },
-					ok === null || ok === undefined ? "未知" : ok ? okText || "正常" : detail || "异常",
+					ok === null || ok === undefined ? "检测中…" : ok ? okText || "正常" : detail || "异常",
 				),
+			);
+
+		/** Pill-shaped toggle switch. */
+		const Switch = ({ on, disabled, onChange }) =>
+			h("button", {
+				className: "dslm-switch" + (on ? " on" : ""),
+				disabled: disabled,
+				onClick: onChange,
+				role: "switch",
+				"aria-checked": !!on,
+				title: on ? "已开启" : "已关闭",
+			});
+
+		const ToggleRow = ({ label, on, disabled, onChange, hint }) =>
+			h(
+				"div",
+				{ className: "dslm-togrow" },
+				h("span", null, label),
+				h("span", { className: "dslm-hint" }, hint || (on ? "已开启" : "已关闭")),
+				h(Switch, { on, disabled, onChange }),
 			);
 
 		const UrlRow = ({ label, value }) =>
@@ -156,15 +183,26 @@ window.__ModuleLoader__.load({
 			const [msg, setMsg] = react.useState("");
 			const [modal, setModal] = react.useState(null);
 
+			const [updated, setUpdated] = react.useState("");
 			const refresh = react.useCallback(() => {
 				fetch("/lan.status.json", { cache: "no-store" })
 					.then((r) => r.json())
-					.then((d) => setSt(d))
+					.then((d) => {
+						setSt(d);
+						try {
+							setUpdated(new Date().toLocaleTimeString());
+						} catch (e) {
+							/* ignore */
+						}
+					})
 					.catch(() => setSt({ error: true }));
 			}, []);
 
 			react.useEffect(() => {
 				refresh();
+				// Async refresh — the page never blocks on detection.
+				const t = setInterval(refresh, 10000);
+				return () => clearInterval(t);
 			}, [refresh]);
 
 			const act = react.useCallback(
@@ -195,7 +233,16 @@ window.__ModuleLoader__.load({
 			);
 
 			if (!st) {
-				return h("div", { className: "dslm-wrap" }, h("div", { className: "dslm-msg" }, "加载状态中…"));
+				// Render the page immediately — status arrives async and rows
+				// show 检测中… until then.
+				return h(
+					"div",
+					{ className: "dslm-wrap" },
+					h("div", { className: "dslm-msg" }, "正在检测…"),
+					h(Card, { title: "局域网(反代)", ok: null }, h(Row, { label: "反代运行中", ok: null })),
+					h(Card, { title: "Tailscale", ok: null }, h(Row, { label: "已连接", ok: null })),
+					h(Card, { title: "证书安装提示", ok: null }, h(Row, { label: "当前状态", ok: null })),
+				);
 			}
 			if (st.error) {
 				return h(
@@ -214,14 +261,20 @@ window.__ModuleLoader__.load({
 			return h(
 				"div",
 				{ className: "dslm-wrap" },
-				h("div", { className: "dslm-msg" }, msg || "所有操作均在此页面完成,接口不对外暴露。"),
+				h(
+					"div",
+					{ className: "dslm-msg" },
+					msg || "所有操作均在此页面完成,接口不对外暴露。",
+					h("button", { className: "dslm-copy", style: { marginLeft: 8 }, onClick: refresh }, "刷新"),
+					updated ? h("span", { style: { marginLeft: 8 } }, "更新于 " + updated) : null,
+				),
 
 				// ── 局域网(反代) ──────────────────────────────────────────
 				h(
 					Card,
 					{ title: "局域网(反代)", ok: c.caddy && c.caddy.running },
 					Row({ label: "反代运行中", ok: c.caddy && c.caddy.running, detail: "未运行", okText: "运行中" }),
-					Row({ label: "自动启动", ok: st.autoStart !== false, detail: "dsh 启动时自动拉起反代", okText: "开启" }),
+					ToggleRow({ label: "反代自启动", on: st.autoStart === true, disabled: busy, onChange: () => act("setAutoStart", { on: !(st.autoStart === true) }), hint: "dsh 启动时自动拉起反代" }),
 					Row({ label: "局域网端口", ok: c.port && c.port.lan, detail: "不可达", okText: "可达" }),
 					Row({ label: "证书", ok: cert.present, detail: "缺失,点「一键配置」", okText: cert.coversLanIp ? "SAN 已覆盖本机 IP" : "SAN 未覆盖当前 IP" }),
 					Row({ label: "本地 CA", ok: cert.ca === "present", detail: "未生成", okText: "已生成" }),
@@ -236,8 +289,6 @@ window.__ModuleLoader__.load({
 								{ label: "停止", onClick: () => act("stop") },
 								{ label: "重启", onClick: () => act("restart") },
 								{ label: "重新生成证书", onClick: () => act("regenCert") },
-								{ label: "自动启动 " + (st.autoStart !== false ? "关" : "开"), onClick: () => act("setAutoStart", { on: st.autoStart === false }) },
-								{ label: "局域网访问不了?", onClick: () => setModal("fw") },
 							],
 						},
 					),
@@ -249,6 +300,7 @@ window.__ModuleLoader__.load({
 					{ title: "Tailscale", ok: ts.running },
 					Row({ label: "已安装", ok: ts.installed, detail: "未安装,见 README" }),
 					Row({ label: "已连接", ok: ts.running, detail: "未连接", okText: ts.dnsName || "已连接" }),
+					ToggleRow({ label: "Tailscale 自启动", on: st.tailscaleAutoStart === true, disabled: busy, onChange: () => act("setTailscaleAutoStart", { on: !(st.tailscaleAutoStart === true) }), hint: "dsh 启动时自动连接" }),
 					Row({ label: "Serve", ok: ts.serve && ts.serve !== "off" && ts.serve !== "unknown" ? true : ts.serve === "off" ? false : null, detail: "未开启,点「Serve 开」后域名免证书", okText: "已开启" }),
 					Row({ label: "tailnet 端口", ok: c.port && c.port.tailnet, detail: "不可达(需 CA 或走 serve)", okText: "可达" }),
 					UrlRow({ label: "域名地址", value: ts.serveUrl || (ts.dnsName ? "https://" + ts.dnsName + "/" : "") }),
@@ -275,28 +327,16 @@ window.__ModuleLoader__.load({
 					Card,
 					{ title: "证书安装提示", ok: notice.enabled },
 					Row({ label: "检测(SAN/mDNS)", ok: cert.present && st.mdns, detail: "mDNS 未运行或证书缺失", okText: "正常" }),
-					Row({ label: "当前状态", ok: notice.enabled, detail: "已关闭(默认)", okText: "已开启" }),
+					ToggleRow({ label: "页面提示开关", on: notice.enabled === true, disabled: busy, onChange: () => act("setCertNotice", { on: !(notice.enabled === true) }), hint: "设备未装 CA 时页面底部提示" }),
 					h(
 						"div",
 						{ className: "dslm-actions" },
-						h("button", { className: "dslm-btn primary", disabled: busy, onClick: () => act("setCertNotice", { on: !notice.enabled }) }, notice.enabled ? "关闭提示" : "开启提示"),
 						h("button", { className: "dslm-btn", disabled: busy, onClick: () => setModal("ca") }, "安装流程"),
 						h("a", { className: "dslm-link", href: "/ca.crt", target: "_blank", rel: "noreferrer" }, "下载 CA 证书"),
 					),
 				),
 
 				// ── 弹窗 ─────────────────────────────────────────────────
-				modal === "fw"
-					? h(
-							Modal,
-							{ title: "局域网无法访问?先放行防火墙", onClose: () => setModal(null) },
-							h("div", { className: "dslm-step" }, "本机是 WSL2,外部设备访问由 Windows 防火墙把关(当前默认拦截入站)。在 Windows 的<b>管理员 PowerShell</b> 中执行:"),
-							h(CmdRow, { cmd: "New-NetFirewallHyperVRule -Name \"dsh-lan-3080\" -DisplayName \"dsh LAN 3080\" -Direction Inbound -Protocol TCP -LocalPorts 3080 -Action Allow" }),
-							h("div", { className: "dslm-step" }, "旧系统没有该命令时,改用:"),
-							h(CmdRow, { cmd: "netsh advfirewall firewall add rule name=\"dsh-lan-3080\" dir=in action=allow protocol=TCP localport=3080" }),
-							h("div", { className: "dslm-step" }, "然后手机/其他设备访问 " + st.url + " 验证;若还不行,检查路由器是否开启了 AP 隔离。"),
-						)
-					: null,
 				modal === "ts"
 					? h(
 							Modal,

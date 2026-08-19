@@ -49,7 +49,11 @@ const DEFAULTS = {
   localPort: 3081,
   lanIp: '',
   caddyBin: 'caddy',
-  autoStart: true,
+  // Nothing auto-starts without the user turning it on in the settings
+  // page (or opting in via cordis.patch.yml): the reverse proxy and
+  // Tailscale both default to OFF at boot.
+  autoStart: false,
+  tailscaleAutoStart: false,
   tailscale: true,
   certNotice: false,
   probeHost: '',
@@ -94,10 +98,12 @@ export function apply(ctx, rawConfig) {
   // change them without editing cordis.patch.yml. Effective value = state
   // file first, then row config, then defaults.
   let autoStart = config.autoStart
+  let tailscaleAutoStart = config.tailscaleAutoStart
   void (async () => {
     try {
       const saved = JSON.parse(await fs.readFile(lanStateFile, 'utf8'))
       if (typeof saved.autoStart === 'boolean') autoStart = saved.autoStart
+      if (typeof saved.tailscaleAutoStart === 'boolean') tailscaleAutoStart = saved.tailscaleAutoStart
     } catch {
       /* first run */
     }
@@ -143,7 +149,7 @@ export function apply(ctx, rawConfig) {
   const reachUrl = (host, port) =>
     new Promise((resolve) => {
       const req = https.request(
-        { hostname: host, port, path: '/', method: 'HEAD', rejectUnauthorized: false, timeout: 2500 },
+        { hostname: host, port, path: '/', method: 'HEAD', rejectUnauthorized: false, timeout: 1500 },
         (res) => {
           res.resume()
           resolve(res.statusCode ? res.statusCode < 500 : false)
@@ -157,7 +163,7 @@ export function apply(ctx, rawConfig) {
   /** Plain-HTTP reachability probe (dsh's own loopback listener is http). */
   const reachHttp = (host, port) =>
     new Promise((resolve) => {
-      const req = http.request({ hostname: host, port, path: '/', method: 'HEAD', timeout: 2500 }, (res) => {
+      const req = http.request({ hostname: host, port, path: '/', method: 'HEAD', timeout: 1500 }, (res) => {
         res.resume()
         resolve(res.statusCode ? res.statusCode < 500 : false)
       })
@@ -255,18 +261,20 @@ export function apply(ctx, rawConfig) {
 
   async function checks() {
     const ip = config.lanIp || detectIp()
-    const caddyBin = await exec('bash', ['-lc', `command -v ${config.caddyBin}`])
-    const confPresent = await fs
-      .access(caddyConf)
-      .then(() => true)
-      .catch(() => false)
-    const caddyProbe = await caddyRunning()
-    const ts = await tailscaleStatus()
-    const port = {
-      lan: await reachUrl(ip, config.port),
-      tailnet: ts.running && ts.tailnetIPs.length ? await reachUrl(ts.tailnetIPs[0], config.port) : false,
-      local: await reachHttp('127.0.0.1', config.localPort),
-    }
+    // Run every probe concurrently — the status endpoint must stay fast so
+    // the settings page opens immediately (probes then update asynchronously).
+    const [caddyBin, confPresent, caddyProbe, ts] = await Promise.all([
+      exec('bash', ['-lc', `command -v ${config.caddyBin}`]),
+      fs.access(caddyConf).then(() => true).catch(() => false),
+      caddyRunning(),
+      tailscaleStatus(),
+    ])
+    const [lan, tailnet, local] = await Promise.all([
+      reachUrl(ip, config.port),
+      ts.running && ts.tailnetIPs.length ? reachUrl(ts.tailnetIPs[0], config.port) : Promise.resolve(false),
+      reachHttp('127.0.0.1', config.localPort),
+    ])
+    const port = { lan, tailnet, local }
     return {
       caddy: {
         installed: caddyBin.ok,
@@ -288,6 +296,7 @@ export function apply(ctx, rawConfig) {
       port: config.port,
       dshLocalPort: config.localPort,
       autoStart,
+      tailscaleAutoStart,
       caddy: { ...caddy, config: caddyConf, healthy: caddy.running ? await healthy() : false },
       cert: await certInfo(),
       mdns: await mdnsStatus(),
@@ -425,8 +434,15 @@ export function apply(ctx, rawConfig) {
         autoStart = body.on === true
         await fs
           .mkdir(caddyDir, { recursive: true })
-          .then(() => fs.writeFile(lanStateFile, JSON.stringify({ autoStart }, null, 2)))
-        return { ok: true, message: `自动启动已${autoStart ? '开启' : '关闭'}(下次启动 dsh 生效)` }
+          .then(() => fs.writeFile(lanStateFile, JSON.stringify({ autoStart, tailscaleAutoStart }, null, 2)))
+        return { ok: true, message: `反代自启动已${autoStart ? '开启' : '关闭'}(下次启动 dsh 生效)` }
+      }
+      case 'setTailscaleAutoStart': {
+        tailscaleAutoStart = body.on === true
+        await fs
+          .mkdir(caddyDir, { recursive: true })
+          .then(() => fs.writeFile(lanStateFile, JSON.stringify({ autoStart, tailscaleAutoStart }, null, 2)))
+        return { ok: true, message: `Tailscale 自启动已${tailscaleAutoStart ? '开启' : '关闭'}(下次启动 dsh 生效)` }
       }
       case 'autoConfig': {
         // One-click bring-up: cert, Caddyfile template, then start the proxy.
@@ -652,16 +668,28 @@ export function apply(ctx, rawConfig) {
     }),
   )
 
-  // ── auto-start ───────────────────────────────────────────────────────────
-  if (autoStart) {
-    setTimeout(() => {
-      start()
-        .then((r) =>
-          log.info(`[lan-manager] auto-start => ${r.ok ? 'ok' : 'failed'} pid=${r.pid || 0} msg=${r.message || ''}`),
-        )
-        .catch((e) => log.warn(`[lan-manager] auto-start error: ${e.message}`))
-    }, 750)
-  }
+  // ── auto-start (both OFF unless the user opted in) ──────────────────────
+  setTimeout(() => {
+    const jobs = []
+    if (autoStart) {
+      jobs.push(
+        start().then((r) =>
+          log.info(`[lan-manager] auto-start(caddy) => ${r.ok ? 'ok' : 'failed'} pid=${r.pid || 0} msg=${r.message || ''}`),
+        ),
+      )
+    }
+    if (config.tailscale && tailscaleAutoStart) {
+      jobs.push(
+        (async () => {
+          const ts = await tailscaleStatus()
+          if (ts.running) return
+          const r = await exec('tailscale', ['up', '--operator=' + os.userInfo().username])
+          log.info(`[lan-manager] auto-start(tailscale) => ${r.ok ? 'ok' : 'failed'} ${r.message || ''}`)
+        })(),
+      )
+    }
+    for (const p of jobs) p.catch((e) => log.warn(`[lan-manager] auto-start error: ${e.message}`))
+  }, 750)
   log.info(`[lan-manager] active deployDir=${deployDir} port=${config.port}`)
 
   return () => {

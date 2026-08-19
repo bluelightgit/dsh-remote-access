@@ -1,3 +1,4 @@
 {
-  "autoStart": true
+  "autoStart": false,
+  "tailscaleAutoStart": false
 }

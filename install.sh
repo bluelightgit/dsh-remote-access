@@ -55,7 +55,6 @@ if ! grep -q "dsh-lan-manager" "$PATCH" 2>/dev/null; then
       config:
         port: $PORT
         localPort: $LOCAL_PORT
-        autoStart: true
         tailscale: true
         certNotice: false
 EOF
