@@ -5,25 +5,27 @@
 #   dsh --lan        ensure local dsh is up, start the Caddy https proxy,
 #                    print the LAN address
 #   dsh --lan-stop   stop the Caddy https proxy (local dsh keeps running)
-#   dsh --stop       stop the Caddy proxy AND the local dsh on :3081
+#   dsh --stop       stop the Caddy proxy AND the local dsh on :3080
 #   dsh <anything>   pass through to the real dsh CLI (e.g. `dsh web --help`)
 #
-# v2 (native Caddy): replaces the ais-nginx-dsh / ais-dsh-bridge docker pair,
-# no docker involved at all. Port layout:
-#   dsh (node)       127.0.0.1:3081  plain http, loopback only
-#   caddy            *:3080          https only, LAN entry (any Host on this
+# v2 (native Caddy): no Docker involved. Port layout:
+#   dsh (node)       127.0.0.1:3080  plain http, loopback only
+#   caddy            *:3081          https only, LAN entry (any Host on this
 #                                    port proxies to dsh, like the old nginx
 #                                    `server_name _`; plaintext is refused)
-# URL: https://<LAN_IP>:3080 — HTTPS only, no plaintext fallback.
+# URL: https://<LAN_IP>:3081 — HTTPS only, no plaintext fallback.
 set -euo pipefail
 
 SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
 DEPLOY_DIR="$(dirname "$SCRIPT")"
-CADDY_DIR="$DEPLOY_DIR/caddy"
+DSH_HOME_ROOT="${DSH_HOME:-$HOME/.dsh}"
+STATE_DIR="${DSH_STATE_DIR:-$DSH_HOME_ROOT/dsh-lan-manager}"
+CADDY_DIR="$STATE_DIR/caddy"
 CADDY_CONF="$CADDY_DIR/Caddyfile"
 CADDY_PID="$CADDY_DIR/caddy.pid"
 CADDY_LOG="$CADDY_DIR/caddy.log"
 CADDY_RUN_LOG="$CADDY_DIR/caddy-run.log"
+DSH_LOCAL_LOG="$STATE_DIR/dsh-local.log"
 
 # The real dsh CLI (npm/npx install). Override with DSH_REAL_BIN; otherwise
 # find it in the npx cache. Caddy binary: default to the system one, override
@@ -54,8 +56,9 @@ detect_lan_ip() {
 }
 
 LAN_IP="${DSH_LAN_IP:-$(detect_lan_ip)}"
-PORT="${DSH_PORT:-3080}"
-LOCAL_PORT="${DSH_LOCAL_PORT:-3081}"
+PORT="${DSH_PORT:-3081}"
+LOCAL_PORT="${DSH_LOCAL_PORT:-3080}"
+TAILSCALE_PORT="${DSH_TAILSCALE_PORT:-3082}"
 
 # Tailscale MagicDNS name (e.g. <hostname>.tail<tailnet>.ts.net): when
 # `tailscale serve` fronts dsh, the browser-trust fence sees that host in
@@ -82,37 +85,55 @@ is_https_up() {
     curl -sk --noproxy '*' -o /dev/null -m 2 "https://$LAN_IP:$PORT/"
 }
 
-caddy_running() {
-    [ -f "$CADDY_PID" ] && [ -n "$(cat "$CADDY_PID" 2>/dev/null)" ] && \
-        kill -0 "$(cat "$CADDY_PID" 2>/dev/null)" 2>/dev/null
+caddy_pid() {
+    [ -f "$CADDY_PID" ] && cat "$CADDY_PID" 2>/dev/null || true
 }
 
-# One-time transition helper: the old docker-based proxy would still own
-# $LAN_IP:$PORT if it is running.
-remove_legacy_docker() {
-    command -v docker >/dev/null 2>&1 || return 0
-    if docker ps -a --format '{{.Names}}' | grep -qx ais-nginx-dsh; then
-        echo "[dsh] removing legacy docker proxy ais-nginx-dsh ..."
-        docker rm -f ais-nginx-dsh >/dev/null 2>&1 || true
-    fi
-    if docker ps -a --format '{{.Names}}' | grep -qx ais-dsh-bridge; then
-        echo "[dsh] removing legacy docker bridge ais-dsh-bridge ..."
-        docker rm -f ais-dsh-bridge >/dev/null 2>&1 || true
-    fi
+caddy_is_ours() {
+    local pid cmdline
+    pid="$(caddy_pid)"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    # A stale pidfile can point at a reused pid or at a user-started caddy.
+    # Only accept a live process whose cmdline contains OUR Caddyfile; when
+    # /proc is unavailable, refuse to guess (never signal a foreign process).
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    [ -n "$cmdline" ] && printf '%s' "$cmdline" | grep -Fq -- "$CADDY_CONF"
+}
+
+caddy_running() {
+    caddy_is_ours
 }
 
 caddy_start() {
-    remove_legacy_docker
+    mkdir -p "$CADDY_DIR" "$DEPLOY_DIR/caddy/certs" 2>/dev/null || true
+    if [ ! -f "$CADDY_CONF" ] && [ -f "$DEPLOY_DIR/caddy/Caddyfile" ]; then
+        cp "$DEPLOY_DIR/caddy/Caddyfile" "$CADDY_CONF"
+    fi
     if caddy_running; then
         echo "[dsh] caddy proxy already running (pid $(cat "$CADDY_PID"))"
         return 0
     fi
 
+    # A live pid in OUR pidfile that does not run OUR Caddyfile belongs to
+    # someone else. Drop the stale pointer but never signal that process.
+    local stale_pid
+    stale_pid="$(caddy_pid)"
+    if [ -n "$stale_pid" ] && kill -0 "$stale_pid" 2>/dev/null && ! caddy_is_ours; then
+        echo "[dsh] pid $stale_pid is not the dsh-lan caddy; ignoring it" >&2
+        rm -f "$CADDY_PID"
+    fi
+
     echo "[dsh] starting caddy https proxy on $LAN_IP:$PORT ..."
     rm -f "$CADDY_PID" "$CADDY_RUN_LOG"
-    # Keep caddy's own data/config out of $HOME; export the deploy root so
-    # the Caddyfile's {$DSH_DEPLOY_DIR} placeholders resolve.
+    # Keep caddy's own data/config out of $HOME; export deploy root and port
+    # so the Caddyfile's {$DSH_*} placeholders resolve.
     DSH_DEPLOY_DIR="$DEPLOY_DIR" \
+    DSH_CADDY_DIR="$CADDY_DIR" \
+    DSH_PORT="$PORT" \
+    DSH_LOCAL_PORT="$LOCAL_PORT" \
+    DSH_TAILSCALE_PORT="$TAILSCALE_PORT" \
     XDG_DATA_HOME="$CADDY_DIR/data" \
     XDG_CONFIG_HOME="$CADDY_DIR/config" \
         nohup "$CADDY_BIN" run --config "$CADDY_CONF" --adapter caddyfile \
@@ -136,36 +157,39 @@ caddy_start() {
 }
 
 caddy_stop() {
-    if caddy_running; then
-        local pid
-        pid="$(cat "$CADDY_PID" 2>/dev/null || true)"
-        if [ -n "$pid" ]; then
-            kill "$pid" 2>/dev/null || true
-            for _ in $(seq 1 20); do
-                kill -0 "$pid" 2>/dev/null || break
-                sleep 0.25
-            done
-        fi
+    local pid
+    pid="$(caddy_pid)"
+    if caddy_is_ours; then
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.25
+        done
         rm -f "$CADDY_PID"
         echo "[dsh] caddy proxy stopped"
     else
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "[dsh] pid $pid is not the dsh-lan caddy; leaving it alone" >&2
+        fi
+        rm -f "$CADDY_PID"
         echo "[dsh] caddy proxy not running"
     fi
 }
 
 lan_start() {
     local started_here=0
+    mkdir -p "$STATE_DIR"
 
     if ! is_local_up; then
-        echo "[dsh] local dsh not running — starting in background on 127.0.0.1:$LOCAL_PORT (log: $DEPLOY_DIR/dsh-local.log)"
-        nohup "$REAL_DSH" web --port "$LOCAL_PORT" $TRUSTED_HOST_ARGS >"$DEPLOY_DIR/dsh-local.log" 2>&1 &
+        echo "[dsh] local dsh not running — starting in background on 127.0.0.1:$LOCAL_PORT (log: $DSH_LOCAL_LOG)"
+        nohup "$REAL_DSH" web --port "$LOCAL_PORT" $TRUSTED_HOST_ARGS >"$DSH_LOCAL_LOG" 2>&1 &
         started_here=1
         for _ in $(seq 1 30); do
             is_local_up && break
             sleep 1
         done
         if ! is_local_up; then
-            echo "[dsh] ERROR: dsh did not start; see $DEPLOY_DIR/dsh-local.log" >&2
+            echo "[dsh] ERROR: dsh did not start; see $DSH_LOCAL_LOG" >&2
             exit 1
         fi
     fi
@@ -173,7 +197,7 @@ lan_start() {
     # Keep the TLS cert in step with the (possibly changed) LAN IP: gen-cert
     # no-ops when the cert already covers the current IP; if it regenerated
     # (exit 10) the running caddy must restart to load the new cert.
-    if "$DEPLOY_DIR/gen-cert.sh"; then
+    if DSH_CERT_DIR="$CADDY_DIR/certs" "$DEPLOY_DIR/gen-cert.sh"; then
         :
     else
         rc=$?
@@ -189,10 +213,10 @@ lan_start() {
 
     echo
     echo "  dsh LAN:  https://$LAN_IP:$PORT/"
-    echo "  (LAN cert is signed by the local CA — install ~/.local/share/dsh-lan/caddy/certs/ca/ca.crt on devices to remove the browser warning; https only, plain http no longer served)"
+    echo "  (LAN cert is signed by the local CA — install $CADDY_DIR/certs/ca/ca.crt on devices to remove the browser warning; https only, plain http no longer served)"
     echo
     if [ "$started_here" = 1 ]; then
-        echo "[dsh] local dsh running in background; log: $DEPLOY_DIR/dsh-local.log"
+        echo "[dsh] local dsh running in background; log: $DSH_LOCAL_LOG"
     else
         echo "[dsh] existing local dsh detected; proxy attached"
     fi
@@ -203,8 +227,15 @@ lan_stop() {
 }
 
 stop_local_dsh() {
-    local pid
+    local pid cmdline
     pid=$(ss -tlnp 2>/dev/null | grep "127.0.0.1:$LOCAL_PORT" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+    if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ]; then
+        cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+        if ! printf '%s' "$cmdline" | grep -Fq -- "dsh web"; then
+            echo "[dsh] process on 127.0.0.1:$LOCAL_PORT (pid $pid) is not dsh; leaving it alone" >&2
+            return 0
+        fi
+    fi
     if [ -n "$pid" ]; then
         kill "$pid" 2>/dev/null || true
         echo "[dsh] stopped local dsh (pid $pid, port $LOCAL_PORT)"

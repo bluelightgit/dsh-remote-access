@@ -1,71 +1,75 @@
 # dsh LAN https proxy — native Caddy.
 #
-# Portable: every local path is resolved through the {$DSH_DEPLOY_DIR}
-# environment variable (exported by the launcher and by dsh-lan-manager when
-# it spawns caddy). Nothing machine-specific is written here.
+# This is the portable default template. At runtime dsh-lan-manager copies it
+# into <dsh-home>/dsh-lan-manager/caddy/Caddyfile and rewrites that copy with
+# the user's access-control settings. Never put machine-specific credentials
+# in this template.
 #
-# dsh itself listens on 127.0.0.1:3081 (plain http). Caddy fronts it on port
-# 3080 (https only) with the leaf cert in caddy/certs — signed by the local
-# CA (caddy/certs/ca) and managed by gen-cert.sh, which re-signs it with the
-# current LAN IP + <hostname>.local + tailnet-IP SAN on every `dsh --lan`.
-# HTTPS only — plaintext on this port is refused (400).
+# Topology:
+#   LAN clients -> https://<LAN_IP>:{$DSH_PORT}
+#   Tailscale    -> https://<host>.ts.net -> tailscaled -> http://127.0.0.1:{$DSH_TAILSCALE_PORT}
+#   Caddy        -> dsh at 127.0.0.1:{$DSH_LOCAL_PORT}
 #
-# IMPORTANT: the site address is PORT-ONLY on purpose. An IP/hostname site
-# address compiles to a Host matcher — requests carrying any other Host (the
-# Tailscale IP, a future domain) get an EMPTY 200 and a blank page.
-# `https://:3080` + manual `tls` serves every Host on this port; the leaf
-# cert's SAN (LAN IP, tailnet IP, localhost, <hostname>.local) decides what
-# validates.
-#
-# /ca.crt and /ca-install.html are served directly by Caddy (never proxied):
-# the CA download and its install page must be reachable even by devices that
-# have not installed the CA yet.
-
+# Runtime paths under {$DSH_CADDY_DIR}; static CA install page stays in the
+# deploy tree under {$DSH_DEPLOY_DIR}.
 {
-	# No admin API and no ACME: this is a fixed self-signed LAN endpoint.
-	admin off
-	auto_https off
+admin off
+auto_https off
+grace_period 3s
 }
 
-https://:3080 {
-	# Leaf cert signed by the local CA in caddy/certs/ca/ and managed by
-	# gen-cert.sh; caddy/certs/dsh.crt is the fullchain (leaf + CA).
-	tls {$DSH_DEPLOY_DIR}/caddy/certs/dsh.crt {$DSH_DEPLOY_DIR}/caddy/certs/dsh.key
+# ── LAN entry: external HTTPS port ────────────────────────────────────────
+https://:{$DSH_PORT} {
+tls {$DSH_CADDY_DIR}/certs/dsh.crt {$DSH_CADDY_DIR}/certs/dsh.key
 
-	# Static routes first so the SPA proxy never swallows them.
-	handle /ca.crt {
-		root * {$DSH_DEPLOY_DIR}/caddy/certs/ca
-		header Content-Type "application/x-x509-ca-cert"
-		file_server
-	}
-	handle /ca-install.html {
-		root * {$DSH_DEPLOY_DIR}/caddy/static
-		file_server
-	}
+handle /ca.crt {
+root * {$DSH_CADDY_DIR}/certs/ca
+header Content-Type "application/x-x509-ca-cert"
+file_server
+}
+handle /ca-install.html {
+root * {$DSH_DEPLOY_DIR}/caddy/static
+file_server
+}
 
-	# Everything else goes to dsh.
-	handle {
-		reverse_proxy 127.0.0.1:3081 {
-			# dsh's node server closes idle keep-alive sockets after its 5s
-			# keepAliveTimeout; a pooled conn reused after that window dies
-			# mid-request ("upstream prematurely closed connection" 502s).
-			# `keepalive off` gives every request a fresh upstream connection.
-			transport http {
-				dial_timeout 10s
-				keepalive off
-			}
-			# Browser-trust fence trick: rewrite Host and Origin to the
-			# loopback authority, which the fence always trusts.
-			header_up Host 127.0.0.1:3081
-			header_up Origin "http://127.0.0.1:3081"
-		}
-	}
+handle {
+reverse_proxy 127.0.0.1:{$DSH_LOCAL_PORT} {
+transport http {
+dial_timeout 10s
+keepalive off
+}
+header_up Host 127.0.0.1:{$DSH_LOCAL_PORT}
+header_up Origin "http://127.0.0.1:{$DSH_LOCAL_PORT}"
+}
+}
 
-	# WebSocket upgrades and on-the-wire compression handled natively.
-	encode gzip
+encode gzip
 
-	log {
-		output file {$DSH_DEPLOY_DIR}/caddy/caddy.log
-		level INFO
-	}
+log {
+output file {$DSH_CADDY_DIR}/caddy.log
+level INFO
+}
+}
+
+# ── Tailscale entry: loopback HTTP only ───────────────────────────────────
+http://:{$DSH_TAILSCALE_PORT} {
+bind 127.0.0.1
+@tailnet header Tailscale-User-Login *
+
+handle @tailnet {
+reverse_proxy 127.0.0.1:{$DSH_LOCAL_PORT} {
+transport http {
+dial_timeout 10s
+keepalive off
+}
+header_up Host 127.0.0.1:{$DSH_LOCAL_PORT}
+header_up Origin "http://127.0.0.1:{$DSH_LOCAL_PORT}"
+}
+}
+
+handle {
+respond "Funnel access is disabled because no Basic Auth credential is configured" 403
+}
+
+encode gzip
 }

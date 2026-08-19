@@ -6,13 +6,8 @@ caddy/data/
 caddy/config/
 caddy/caddy.pid
 caddy/cert-notice.json
+caddy/auth-state.json
 caddy/*.log
 # dsh 日志
 dsh-local.log
 *.log
-# 测试/临时
-.test/
-# 遗留的 docker 时代文件与其它项目(ais)的 nginx 配置,不属于本方案
-bridge/
-nginx/
-bridge.py

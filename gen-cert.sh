@@ -18,7 +18,7 @@ set -euo pipefail
 
 SCRIPT="$(readlink -f "${BASH_SOURCE[0]}")"
 DEPLOY_DIR="$(dirname "$SCRIPT")"
-CERT_DIR="$DEPLOY_DIR/caddy/certs"
+CERT_DIR="${DSH_CERT_DIR:-$DEPLOY_DIR/caddy/certs}"
 CA_DIR="$CERT_DIR/ca"
 WORK_DIR="$CERT_DIR/.work"
 
@@ -38,7 +38,7 @@ LAN_IP="${DSH_LAN_IP:-$(detect_ip)}"
 # mDNS name (probe target for the CA-install banner). Devices resolve
 # <hostname>.local over mDNS; the server should run avahi-daemon.
 HOSTNAME="${DSH_HOSTNAME:-$(hostname)}"
-# Tailnet IPv4 (if Tailscale is up): so certs also cover https://100.x:3080
+# Tailnet IPv4 (if Tailscale is up): so certs also cover https://100.x:3081
 # served through the LAN proxy, keeping the CA-install flow consistent.
 TS_IP=""
 if command -v tailscale >/dev/null 2>&1; then
@@ -52,12 +52,13 @@ DAYS=825     # ~27 months, then auto-renewed by re-running this script
 CA_DAYS=3650
 
 mkdir -p "$CERT_DIR" "$CA_DIR" "$WORK_DIR"
+trap 'rm -rf "$WORK_DIR"' EXIT
 
 # Already good? leaf present, not expiring within 30 days, SAN covers the
 # current LAN IP.
 if [ -f "$CERT" ] && [ -f "$KEY" ] && [ -f "$CA_CERT" ] && \
    openssl x509 -in "$CERT" -noout -checkend 2592000 >/dev/null 2>&1 && \
-   openssl x509 -in "$CERT" -noout -ext subjectAltName 2>/dev/null | grep -q "IP Address:$LAN_IP"; then
+   openssl x509 -in "$CERT" -noout -ext subjectAltName 2>/dev/null | grep -Fq "IP Address:$LAN_IP"; then
     echo "[gen-cert] cert up to date for $LAN_IP"
     exit 0
 fi
@@ -68,12 +69,15 @@ if [ ! -f "$CA_KEY" ] || [ ! -f "$CA_CERT" ]; then
     openssl req -x509 -newkey rsa:2048 -nodes -days "$CA_DAYS" \
         -keyout "$CA_KEY" -out "$CA_CERT" \
         -subj "/CN=dsh-lan-ca (install this CA on your devices)" 2>>"$WORK_DIR/gen.log"
+    chmod 600 "$CA_KEY"
+    chmod 644 "$CA_CERT"
 fi
 
 echo "[gen-cert] generating server cert for $LAN_IP ..."
 openssl req -newkey rsa:2048 -nodes \
     -keyout "$KEY" -out "$WORK_DIR/dsh.csr" \
     -subj "/CN=$LAN_IP" 2>>"$WORK_DIR/gen.log"
+chmod 600 "$KEY"
 
 cat > "$WORK_DIR/dsh.ext" <<EOF
 subjectAltName=IP:$LAN_IP,IP:127.0.0.1,DNS:localhost,DNS:$HOSTNAME.local$(if [ -n "$TS_IP" ]; then printf ",IP:%s" "$TS_IP"; fi)
