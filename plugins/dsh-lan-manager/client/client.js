@@ -189,6 +189,7 @@ window.__ModuleLoader__.load({
 					Card,
 					{ title: "局域网(反代)", ok: c.caddy && c.caddy.running },
 					Row({ label: "反代运行中", ok: c.caddy && c.caddy.running, detail: "未运行", okText: "运行中" }),
+					Row({ label: "自动启动", ok: st.autoStart !== false, detail: "dsh 启动时自动拉起反代", okText: "开启" }),
 					Row({ label: "局域网端口", ok: c.port && c.port.lan, detail: "不可达", okText: "可达" }),
 					Row({ label: "证书", ok: cert.present, detail: "缺失,点「一键配置」", okText: cert.coversLanIp ? "SAN 已覆盖本机 IP" : "SAN 未覆盖当前 IP" }),
 					Row({ label: "本地 CA", ok: cert.ca === "present", detail: "未生成", okText: "已生成" }),

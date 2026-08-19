@@ -155,6 +155,15 @@ export function apply(ctx, rawConfig) {
   const caddyRunning = async () => {
     const pid = await readPid()
     if (!alive(pid)) return { running: false, pid: 0 }
+    // The pidfile may be stale (crash, kill -9) and the pid reused by an
+    // unrelated process — kill -0 alone would false-positive. On Linux,
+    // verify the process is actually caddy before reporting running.
+    try {
+      const comm = (await fs.readFile(`/proc/${pid}/comm`, 'utf8')).trim()
+      if (comm !== 'caddy') return { running: false, pid, stale: true }
+    } catch {
+      // Non-Linux or unreadable /proc: fall back to pid-alive only.
+    }
     return { running: true, pid }
   }
 
@@ -264,6 +273,7 @@ export function apply(ctx, rawConfig) {
       url: `https://${ip}:${config.port}/`,
       port: config.port,
       dshLocalPort: config.localPort,
+      autoStart: config.autoStart,
       caddy: { ...caddy, config: caddyConf, healthy: caddy.running ? await healthy() : false },
       cert: await certInfo(),
       mdns: await mdnsStatus(),
