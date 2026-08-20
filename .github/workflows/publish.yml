@@ -1,0 +1,47 @@
+name: Publish package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Verify package version matches tag
+        run: |
+          test "${GITHUB_REF_NAME}" = "v$(node -p "require('./package.json').version")"
+
+      - name: Run tests
+        run: npm test
+
+      - name: Check package contents
+        run: |
+          npm pack --dry-run --json > pack.json
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs'
+
+          const result = JSON.parse(readFileSync('pack.json', 'utf8'))[0]
+          if (result.name !== '@greenonion/dsh-remote-access') throw new Error(`unexpected package: ${result.name}`)
+          if (result.files.some(({ path }) => path.startsWith('test/'))) throw new Error('tests must not be published')
+          NODE
+
+      - name: Publish package
+        run: npm publish

@@ -5,7 +5,7 @@
 # removed from the profile's cordis.patch.yml to avoid double-mounting.
 - insert:
     - id: remote-access
-      name: dsh-remote-access
+      name: '@greenonion/dsh-remote-access'
       config:
         port: 3081
         localPort: 3080
