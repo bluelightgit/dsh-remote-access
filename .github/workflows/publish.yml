@@ -38,7 +38,9 @@ jobs:
           import { readFileSync } from 'node:fs'
 
           const result = JSON.parse(readFileSync('pack.json', 'utf8'))[0]
+          const client = readFileSync('client/client.js', 'utf8')
           if (result.name !== '@greenonion/dsh-remote-access') throw new Error(`unexpected package: ${result.name}`)
+          if (!client.includes('id: "@greenonion/dsh-remote-access"')) throw new Error('client bundle registration does not match the package name')
           if (result.files.some(({ path }) => path.startsWith('test/'))) throw new Error('tests must not be published')
           NODE
 

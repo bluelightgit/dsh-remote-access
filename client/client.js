@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-	id: "dsh-remote-access",
+	id: "@greenonion/dsh-remote-access",
 	factory: (require) => {
 		var module = { exports: {} };
 		var exports = module.exports;
