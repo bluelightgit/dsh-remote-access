@@ -1,6 +1,6 @@
 {
   "name": "@greenonion/dsh-remote-access",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH web plugin for LAN and Tailscale remote access through Caddy with API access policies.",
   "repository": {
     "type": "git",
