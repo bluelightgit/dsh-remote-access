@@ -1,10 +1,10 @@
-// dsh-lan-manager — LAN exposure orchestration for the dsh web profile.
+// dsh-remote-access — remote-access orchestration for the dsh web profile.
 //
 // Host-side plugin that manages:
 //   - a native Caddy https reverse proxy in front of dsh (spawn/kill/restart,
 //     pidfile + health-checked, idempotent),
 //   - the local-CA TLS certificate (status via crypto.X509Certificate,
-//     regeneration via the gen-cert.sh next to the deploy root),
+//     regeneration via the cross-platform gen-cert.js next to the deploy root),
 //   - the "install the CA" banner on the dsh page (OFF by default; toggled
 //     through the settings page or the setCertNotice action; state persists
 //     in <stateDir>/caddy/cert-notice.json),
@@ -12,28 +12,38 @@
 //   - an mDNS/avahi readiness probe for the banner detection.
 //
 // The deploy root is this package's own directory. Runtime state lives under
-// <dsh-home>/dsh-lan-manager (see README), so the package directory stays
+// <dsh-home>/dsh-remote-access (see README), so the package directory stays
 // portable and contains no machine-specific paths, IPs, or hostnames.
 //
 // HTTP surface (registered on the webserver, outside /api):
-//   GET  /lan.status.json → status + checks
-//   POST /lan.action      → { action: 'start'|'stop'|'restart'|'regenCert'
+//   GET  /remote-access.status.json → status + checks
+//   POST /remote-access.action      → { action: 'start'|'stop'|'restart'|'regenCert'
 //                              |'autoConfig'|'setCertNotice'|'tailscaleUp'
-//                              |'tailscaleDown'|'tailscaleFunnel'|'tailscaleServe' }
+//                              |'tailscaleDown'|'tailscaleFunnel'|'tailscaleServe'
+//                              |'setApiAccess' }
 //
 // On disposal, SIGINT/SIGTERM, or process exit the plugin stops only the
-// services it owns (or that are demonstrably dsh-lan — same Caddyfile path).
+// services it owns (or that are demonstrably dsh-remote-access — same Caddyfile path).
 // A caddy or Tailscale session started by the user is left untouched.
 import { spawn, execFile, spawnSync } from 'node:child_process'
-import { promises as fs, openSync, closeSync, readFileSync } from 'node:fs'
+import { promises as fs, openSync, closeSync, chmodSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
 import https from 'node:https'
 import { fileURLToPath } from 'node:url'
 import { X509Certificate, randomBytes, timingSafeEqual } from 'node:crypto'
+import {
+  ACCESS_MODES,
+  API_METHOD_CATALOG,
+  createApiGateway,
+  DEFAULT_BASIC_API_ALLOWLIST,
+  isKnownApiMethod,
+  isPrivilegedApiMethod,
+  normalizeApiAccessPolicy,
+} from './api-gateway.js'
 
-export const name = 'dsh-lan-manager'
+export const name = 'dsh-remote-access'
 export const inject = ['webServer']
 
 // No Config schema on purpose: the plugin imports nothing outside node's
@@ -44,11 +54,13 @@ export const inject = ['webServer']
 // through unchanged when a plugin exports no Config.
 const DEFAULTS = {
   deployDir: '', // derived from this file's location
-  stateDir: '', // runtime config/state; defaults to $DSH_HOME/dsh-lan-manager (~/.dsh/dsh-lan-manager)
+  stateDir: '', // runtime config/state; defaults to $DSH_HOME/dsh-remote-access (~/.dsh/dsh-remote-access)
   port: 3081,
   localPort: 3080,
   tailscalePort: 3082,
+  apiGatewayPort: 3083,
   lanIp: '',
+  lanBind: '',
   caddyBin: 'caddy',
   // Nothing auto-starts without the user turning it on in the settings
   // page (or opting in via cordis.patch.yml): the reverse proxy and
@@ -66,9 +78,36 @@ const DEFAULTS = {
   funnelRequiresAuth: true,
   basicAuthUser: 'dsh',
   basicAuthHash: '',
+  // Remote API access is enforced by the local gateway. The default is an
+  // explicit allowlist; LAN/Serve may opt into a deliberately broad wildcard
+  // policy from the settings page, while Funnel is always normalized back to
+  // the basic policy.
+  apiAccess: {
+    lan: { allow: DEFAULT_BASIC_API_ALLOWLIST, events: true, allApis: false, trustedRemoteSettings: false },
+    serve: { allow: DEFAULT_BASIC_API_ALLOWLIST, events: true, allApis: false, trustedRemoteSettings: false },
+    funnel: { allow: DEFAULT_BASIC_API_ALLOWLIST, events: true, allApis: false, trustedRemoteSettings: false },
+  },
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+async function ensurePrivateDir(dir) {
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 })
+  await fs.chmod(dir, 0o700).catch(() => {})
+}
+
+async function atomicWrite(file, data, mode = 0o600) {
+  await ensurePrivateDir(path.dirname(file))
+  const temp = `${file}.tmp-${process.pid}-${randomBytes(8).toString('hex')}`
+  try {
+    await fs.writeFile(temp, data, { mode })
+    await fs.chmod(temp, mode).catch(() => {})
+    await fs.rename(temp, file)
+    await fs.chmod(file, mode).catch(() => {})
+  } finally {
+    await fs.unlink(temp).catch(() => {})
+  }
+}
 
 /** First non-internal IPv4, preferring RFC1918 — mirrors the launcher. */
 function detectIp() {
@@ -84,32 +123,94 @@ function detectIp() {
   return rfc1918 || ips[0] || '127.0.0.1'
 }
 
+function validProbeHost(value) {
+  const host = String(value || '').trim()
+  return host.length > 0 && host.length <= 253 && /^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(host) ? host : ''
+}
+
+function validBasicAuthUser(value) {
+  const user = String(value || '').trim()
+  return user.length > 0 && user.length <= 64 && /^[A-Za-z0-9._-]+$/.test(user) ? user : ''
+}
+
+function validBasicAuthHash(value) {
+  const hash = String(value || '').trim()
+  return hash.length <= 256 && /^[A-Za-z0-9$./_+-]+$/.test(hash) ? hash : ''
+}
+
+// `tailscale funnel status --json` currently exposes the shared Serve route
+// but not whether that route is public. Only an explicit public/tailnet-only
+// marker from the human-readable status is authoritative; unknown output is
+// deliberately reported as unknown instead of guessing that Funnel is on.
+export function parseFunnelStatus(output) {
+  const text = String(output || '').trim()
+  if (!text) return { state: 'unknown', detail: 'empty Funnel status' }
+  const header = text.split(/\r?\n/).map((line) => line.trim()).find((line) => /^https?:\/\//i.test(line)) || text.split(/\r?\n/)[0].trim()
+  if (/\(\s*public\s*\)/i.test(header)) return { state: 'on', detail: header }
+  if (/\(\s*tailnet\s+only\s*\)/i.test(header)) return { state: 'off', detail: header }
+  if (/^(?:no|not\s+running|funnel\s+(?:is\s+)?(?:off|disabled))\b/i.test(text)) return { state: 'off', detail: text.split(/\r?\n/)[0].trim() }
+  return { state: 'unknown', detail: header || text.split(/\r?\n/)[0].trim() }
+}
+
+function scriptString(value) {
+  return JSON.stringify(value).replace(/[<>&\u2028\u2029]/g, (char) => ({ '<': '\\u003c', '>': '\\u003e', '&': '\\u0026', '\u2028': '\\u2028', '\u2029': '\\u2029' })[char])
+}
+
 export function apply(ctx, rawConfig) {
   // Merge raw row config over portable defaults (no schema: cordis passes
   // the raw config through unchanged).
   const config = { ...DEFAULTS, ...(rawConfig || {}) }
+  if (ctx.webServer.host !== '127.0.0.1') {
+    throw new Error('dsh-remote-access requires DSH webServer host 127.0.0.1; remote access must terminate at Caddy')
+  }
+  const log = ctx.logger
+  // Certificate generation and mDNS detection are optional features; their
+  // availability never blocks the core remote-access path.
+  const certSupported = true
+  const mdnsSupported = process.platform === 'linux' || process.platform === 'darwin'
   // Deploy root derived from this file's real location (symlinks resolved).
   const here = path.dirname(fileURLToPath(import.meta.url))
-  // The plugin package root is the deploy root: it ships the Caddyfile
-  // template, static CA page, and gen-cert.sh alongside index.js.
+  // The plugin package root is also the deploy root for gen-cert.js.
   const deployDir = config.deployDir || here
   // dsh keeps all user data under one home root: explicit config first,
   // then $DSH_HOME, then ~/.dsh. Runtime state for this plugin lives in
-  // <dsh-home>/dsh-lan-manager, so the deploy directory stays read-only and
+  // <dsh-home>/dsh-remote-access, so the deploy directory stays read-only and
   // portable across machines.
   const dshHome = config.stateDir || (process.env.DSH_HOME && process.env.DSH_HOME.trim()) || path.join(os.homedir(), '.dsh')
-  const stateDir = path.resolve(dshHome, 'dsh-lan-manager')
+  const stateDir = path.resolve(dshHome, 'dsh-remote-access')
   const caddyDir = path.join(stateDir, 'caddy')
   const pidFile = path.join(caddyDir, 'caddy.pid')
   const runLog = path.join(caddyDir, 'caddy-run.log')
   const caddyConf = path.join(caddyDir, 'Caddyfile')
   const certFile = path.join(caddyDir, 'certs', 'dsh.crt')
   const caFile = path.join(caddyDir, 'certs', 'ca', 'ca.crt')
-  const genCert = path.join(deployDir, 'gen-cert.sh')
+  const genCert = path.join(deployDir, 'gen-cert.js')
   const noticeStateFile = path.join(caddyDir, 'cert-notice.json')
-  const lanStateFile = path.join(caddyDir, 'lan-state.json')
+  const stateFile = path.join(caddyDir, 'remote-access-state.json')
   const authStateFile = path.join(caddyDir, 'auth-state.json')
-  const log = ctx.logger
+  const secureRuntimeFiles = async () => {
+    for (const file of [pidFile, runLog, caddyConf, noticeStateFile, stateFile, authStateFile]) {
+      await fs.chmod(file, 0o600).catch(() => {})
+    }
+  }
+  void ensurePrivateDir(stateDir).then(() => ensurePrivateDir(caddyDir)).then(secureRuntimeFiles).catch((error) => {
+    log.warn(`[remote-access] cannot secure runtime directory: ${error.message}`)
+  })
+  // Bootstrap the gateway with the least-privileged built-in policy. The
+  // persisted profile policy is loaded below before the settings surface is
+  // usable, then applied atomically through setPolicy(). This avoids a boot
+  // race where a previously saved restrictive policy would briefly be wider.
+  const configuredApiAccess = normalizeApiAccessPolicy(config.apiAccess)
+  let apiAccess = normalizeApiAccessPolicy({})
+  const apiGateway = createApiGateway({
+    port: config.apiGatewayPort,
+    localPort: config.localPort,
+    policy: apiAccess,
+    logger: log,
+  })
+  void apiGateway.ready.catch((error) => {
+    log.warn(`[remote-access] API gateway failed to listen on 127.0.0.1:${config.apiGatewayPort}: ${error.message}`)
+  })
 
   // Runtime-toggled settings: persisted so the settings page can change them
   // without editing cordis.patch.yml. Effective value = state file first,
@@ -119,15 +220,16 @@ export function apply(ctx, rawConfig) {
   let lanAuth = config.lanAuth === true
   let serveAuth = config.serveAuth === true
   const funnelRequiresAuth = config.funnelRequiresAuth !== false
-  let basicAuthUser = config.basicAuthUser || 'dsh'
-  let basicAuthHash = typeof config.basicAuthHash === 'string' ? config.basicAuthHash : ''
+  let basicAuthUser = validBasicAuthUser(config.basicAuthUser) || 'dsh'
+  let basicAuthHash = validBasicAuthHash(config.basicAuthHash)
   let resolveSettingsLoaded
   const settingsLoaded = new Promise((resolve) => {
     resolveSettingsLoaded = resolve
   })
   void (async () => {
+    let saved = null
     try {
-      const saved = JSON.parse(await fs.readFile(lanStateFile, 'utf8'))
+      saved = JSON.parse(await fs.readFile(stateFile, 'utf8'))
       if (typeof saved.autoStart === 'boolean') autoStart = saved.autoStart
       if (typeof saved.tailscaleAutoStart === 'boolean') tailscaleAutoStart = saved.tailscaleAutoStart
       if (typeof saved.lanAuth === 'boolean') lanAuth = saved.lanAuth
@@ -137,33 +239,49 @@ export function apply(ctx, rawConfig) {
     }
     try {
       const auth = JSON.parse(await fs.readFile(authStateFile, 'utf8'))
-      if (typeof auth.user === 'string' && auth.user) basicAuthUser = auth.user
-      if (typeof auth.hash === 'string' && auth.hash) basicAuthHash = auth.hash
+      if (typeof auth.user === 'string' && validBasicAuthUser(auth.user)) basicAuthUser = validBasicAuthUser(auth.user)
+      if (typeof auth.hash === 'string' && validBasicAuthHash(auth.hash)) basicAuthHash = validBasicAuthHash(auth.hash)
     } catch {
       /* credentials are generated on demand */
     }
+    apiAccess = normalizeApiAccessPolicy(saved && saved.apiAccess !== undefined ? saved.apiAccess : configuredApiAccess)
+    apiGateway.setPolicy(apiAccess)
     resolveSettingsLoaded()
   })()
 
   const persistRuntimeSettings = async () => {
-    await fs.mkdir(caddyDir, { recursive: true })
-    await fs.writeFile(lanStateFile, JSON.stringify({ autoStart, tailscaleAutoStart, lanAuth, serveAuth }, null, 2) + '\n')
+    await atomicWrite(stateFile, JSON.stringify({ autoStart, tailscaleAutoStart, lanAuth, serveAuth, apiAccess }, null, 2) + '\n')
   }
 
   const persistAuthState = async () => {
-    await fs.mkdir(caddyDir, { recursive: true })
-    await fs.writeFile(authStateFile, JSON.stringify({ user: basicAuthUser, hash: basicAuthHash }, null, 2) + '\n', { mode: 0o600 })
+    await atomicWrite(authStateFile, JSON.stringify({ user: basicAuthUser, hash: basicAuthHash }, null, 2) + '\n')
   }
 
-  const proxyToDsh = () => [
+  const proxyToDsh = (mode = '') => [
     `\t\treverse_proxy 127.0.0.1:{$DSH_LOCAL_PORT} {`,
     '\t\t\ttransport http {',
     '\t\t\t\tdial_timeout 10s',
     '\t\t\t\tkeepalive off',
     '\t\t\t}',
-    '\t\t\theader_up Host 127.0.0.1:{$DSH_LOCAL_PORT}',
-    '\t\t\theader_up Origin "http://127.0.0.1:{$DSH_LOCAL_PORT}"',
+    ...(mode ? [`\t\t\theader_up X-DSH-Remote-Access-Mode ${mode}`] : []),
     '\t\t}',
+  ]
+
+  const proxyToApiGateway = (mode) => [
+    `\t\treverse_proxy 127.0.0.1:{$DSH_API_GATEWAY_PORT} {`,
+    '\t\t\ttransport http {',
+    '\t\t\t\tdial_timeout 10s',
+    '\t\t\t\tkeepalive off',
+    '\t\t\t}',
+    `\t\t\theader_up X-DSH-Access-Mode ${mode}`,
+    '\t\t}',
+  ]
+
+  // The browser-side settings bridge needs to distinguish Serve from Funnel,
+  // whose public URLs can otherwise be identical. This cookie is only a mode
+  // hint; the gateway remains the authority for every privileged request.
+  const accessModeCookie = (mode) => [
+    `\t\theader Set-Cookie "dsh-remote-access-mode=${mode}; Path=/; Secure; SameSite=Strict"`,
   ]
 
   const basicAuthLines = () => [
@@ -173,13 +291,11 @@ export function apply(ctx, rawConfig) {
   ]
 
   const buildCaddyfile = () => {
-    const lanAuthLines = lanAuth && basicAuthHash ? basicAuthLines() : []
-    const serveAuthLines = serveAuth && basicAuthHash ? basicAuthLines() : []
-    const funnelLines = basicAuthHash
-      ? [...basicAuthLines(), ...proxyToDsh()]
-      : ['\t\trespond "Funnel access is disabled because no Basic Auth credential is configured" 403']
+    const missingAuthLines = (scope) => [`\t\trespond "${scope} access is disabled because no Basic Auth credential is configured" 503`]
+    const lanAuthLines = lanAuth ? (basicAuthHash ? basicAuthLines() : missingAuthLines('LAN')) : []
+    const serveAuthLines = serveAuth ? (basicAuthHash ? basicAuthLines() : missingAuthLines('Serve')) : []
     const lines = [
-      '# dsh LAN https proxy — native Caddy. Generated by dsh-lan-manager.',
+      '# dsh remote-access https proxy — native Caddy. Generated by dsh-remote-access.',
       '#',
       '# Topology:',
       '#   LAN clients -> https://<LAN_IP>:{$DSH_PORT}',
@@ -193,6 +309,7 @@ export function apply(ctx, rawConfig) {
       '}',
       '',
       'https://:{$DSH_PORT} {',
+      '\tbind {$DSH_LAN_BIND}',
       '\ttls {$DSH_CADDY_DIR}/certs/dsh.crt {$DSH_CADDY_DIR}/certs/dsh.key',
       '',
       '\thandle /ca.crt {',
@@ -201,9 +318,17 @@ export function apply(ctx, rawConfig) {
       '\t\tfile_server',
       '\t}',
       '',
-      '\thandle {',
+      '\t@lan_api path /api /api/*',
+      '\thandle @lan_api {',
+      ...accessModeCookie('lan'),
       ...lanAuthLines,
-      ...proxyToDsh(),
+      ...proxyToApiGateway('lan'),
+      '\t}',
+      '',
+      '\thandle {',
+      ...accessModeCookie('lan'),
+      ...lanAuthLines,
+      ...proxyToDsh('lan'),
       '\t}',
       '',
       '\tencode gzip',
@@ -216,16 +341,44 @@ export function apply(ctx, rawConfig) {
       '',
       'http://:{$DSH_TAILSCALE_PORT} {',
       '\tbind 127.0.0.1',
+      '\t@tailnet_api {',
+      '\t\theader Tailscale-User-Login *',
+      '\t\tpath /api /api/*',
+      '\t}',
       '\t@tailnet header Tailscale-User-Login *',
       '',
-      '\thandle @tailnet {',
+      '\thandle @tailnet_api {',
+      ...accessModeCookie('serve'),
       ...serveAuthLines,
-      ...proxyToDsh(),
+      ...proxyToApiGateway('serve'),
       '\t}',
       '',
-      '\thandle {',
-      ...funnelLines,
+      '\thandle @tailnet {',
+      ...accessModeCookie('serve'),
+      ...serveAuthLines,
+      ...proxyToDsh('serve'),
       '\t}',
+      '',
+      ...(basicAuthHash
+        ? [
+            '\t@funnel_api path /api /api/*',
+            '\thandle @funnel_api {',
+            ...accessModeCookie('funnel'),
+            ...basicAuthLines(),
+            ...proxyToApiGateway('funnel'),
+            '\t}',
+            '',
+            '\thandle {',
+            ...accessModeCookie('funnel'),
+            ...basicAuthLines(),
+            ...proxyToDsh('funnel'),
+            '\t}',
+          ]
+        : [
+            '\thandle {',
+            '\t\trespond "Funnel access is disabled because no Basic Auth credential is configured" 403',
+            '\t}',
+          ]),
       '',
       '\tencode gzip',
       '}',
@@ -235,11 +388,11 @@ export function apply(ctx, rawConfig) {
   }
 
   const writeCaddyfile = async () => {
-    await fs.mkdir(caddyDir, { recursive: true })
-    await fs.writeFile(caddyConf, buildCaddyfile(), { mode: 0o600 })
+    await atomicWrite(caddyConf, buildCaddyfile())
   }
 
   const applyCaddyfile = async () => {
+    await settingsLoaded
     await writeCaddyfile()
     const current = await caddyRunning()
     if (!current.running) return { ok: true, message: 'caddy config written' }
@@ -411,12 +564,13 @@ export function apply(ctx, rawConfig) {
     return { running: false, pid, stale: true }
   }
 
-  const exec = (cmd, args, env) =>
+  const exec = (cmd, args, env, input) =>
     new Promise((resolve) => {
-      execFile(cmd, args, { timeout: 15000, env: { ...process.env, ...(env || {}) } }, (err, stdout, stderr) => {
+      const child = execFile(cmd, args, { timeout: 15000, env: { ...process.env, ...(env || {}) } }, (err, stdout, stderr) => {
         if (err) resolve({ ok: false, code: err.code, message: (stderr || err.message || '').toString().trim() })
         else resolve({ ok: true, output: stdout.toString().trim() })
       })
+      if (input !== undefined) child.stdin.end(input)
     })
 
   async function certInfo() {
@@ -451,25 +605,29 @@ export function apply(ctx, rawConfig) {
     const found = await exec('tailscale', ['version'])
     if (!found.ok) return { enabled: true, installed: false, detail: found.message }
 
-    // Run the three status commands concurrently; sequential execFile calls
-    // were the main reason /lan.status.json felt slow while Tailscale was up.
-    const [st, funnelJson, serveJson] = await Promise.all([
+    // Run status commands concurrently; sequential execFile calls were the
+    // main reason /remote-access.status.json felt slow while Tailscale was up.
+    // Serve is read from structured JSON, but Funnel's public/tailnet-only
+    // distinction comes from the explicit marker in its human-readable
+    // status. Current Tailscale versions return Serve-shaped JSON for Funnel
+    // without an AllowFunnel field.
+    const [st, funnelJson, funnelPlain, serveJson] = await Promise.all([
       exec('tailscale', ['status', '--json']),
       exec('tailscale', ['funnel', 'status', '--json']),
+      exec('tailscale', ['funnel', 'status']),
       exec('tailscale', ['serve', 'status', '--json']),
     ])
-    if (!st.ok) return { enabled: true, installed: true, accessDenied: true, detail: st.message }
+    if (!st.ok) return { enabled: true, installed: true, accessDenied: true, funnelState: 'unknown', detail: st.message }
     let parsed
     try {
       parsed = JSON.parse(st.output)
     } catch {
-      return { enabled: true, installed: true, detail: 'unparsable status' }
+      return { enabled: true, installed: true, funnelState: 'unknown', detail: 'unparsable status' }
     }
     const self = parsed.Self || {}
 
-    // Prefer the structured `status --json` output for Serve/Funnel. Older
-    // CLI versions without --json fall back to plain text with simple
-    // substring checks — no regular expressions.
+    // Prefer structured JSON for the shared Serve route. Funnel public mode
+    // is parsed separately from its explicit human-readable status marker.
     const parseJson = (output) => {
       try {
         return JSON.parse(output)
@@ -493,19 +651,18 @@ export function apply(ctx, rawConfig) {
       return { routes, target }
     }
 
-    let funnelConfig = parseJson(funnelJson.output)
-    let funnelText = ''
-    if (!funnelConfig) {
-      const funnelPlain = await exec('tailscale', ['funnel', 'status'])
-      if (funnelPlain.ok) funnelText = funnelPlain.output.trim()
+    const funnelConfig = parseJson(funnelJson.output)
+    const funnelText = funnelPlain.ok ? funnelPlain.output.trim() : ''
+    const plainFunnel = funnelPlain.ok ? parseFunnelStatus(funnelText) : { state: 'unknown', detail: funnelPlain.message || 'Funnel status unavailable' }
+    let funnelState = plainFunnel.state
+    // Some older/newer CLIs expose AllowFunnel in JSON. Use it only when the
+    // field is actually present; a shared Serve route alone is not evidence
+    // that public Funnel is enabled.
+    if (funnelState === 'unknown' && funnelConfig && funnelConfig.AllowFunnel && typeof funnelConfig.AllowFunnel === 'object') {
+      const allowed = Object.values(funnelConfig.AllowFunnel)
+      funnelState = allowed.some((value) => value === true) ? 'on' : 'off'
     }
-    let funnelOn = false
-    if (funnelConfig) {
-      const allowed = funnelConfig.AllowFunnel || {}
-      funnelOn = Object.values(allowed).some((value) => value === true)
-    } else {
-      funnelOn = funnelText.toLowerCase().includes('funnel on')
-    }
+    const funnelOn = funnelState === 'on'
 
     let serveConfig = parseJson(serveJson.output)
     let serveText = ''
@@ -530,6 +687,8 @@ export function apply(ctx, rawConfig) {
       tailnetIPs: Array.isArray(self.TailscaleIPs) ? self.TailscaleIPs : [],
       funnel: funnelConfig ? JSON.stringify(funnelConfig) : funnelText || undefined,
       funnelOn,
+      funnelState,
+      funnelStatusDetail: plainFunnel.detail,
       serve: routes.length ? routes : serveConfig ? 'off' : serveJson.ok ? 'off' : 'unknown',
       serveDetail: serveConfig ? JSON.stringify(serveConfig) : serveText || serveJson.message,
       serveUrl: routes[0] || '',
@@ -539,6 +698,12 @@ export function apply(ctx, rawConfig) {
 
 
   async function mdnsStatus() {
+    // macOS runs mDNSResponder as part of the OS. Linux needs an active
+    // Avahi service for the `.local` probe; Windows support is deliberately
+    // reported as unavailable because Bonjour/WSL service ownership cannot be
+    // inferred safely from this process.
+    if (process.platform === 'darwin') return true
+    if (process.platform !== 'linux') return false
     const r = await exec('systemctl', ['is-active', 'avahi-daemon'])
     return r.ok && r.output === 'active'
   }
@@ -569,20 +734,32 @@ export function apply(ctx, rawConfig) {
         running: caddyProbe.running,
       },
       port,
+      apiGateway: {
+        host: '127.0.0.1',
+        port: apiGateway.port,
+        listening: apiGateway.listening,
+        access: apiAccess,
+      },
       tailscale: ts,
     }
   }
 
   async function status() {
+    await settingsLoaded
     const ip = config.lanIp || detectIp()
     const checked = await checks()
     const caddy = checked.caddy
     return {
       lanIp: ip,
       url: `https://${ip}:${config.port}/`,
+      platform: process.platform,
+      certSupported,
+      mdnsSupported,
       port: config.port,
       dshLocalPort: config.localPort,
       tailscalePort: config.tailscalePort,
+      apiGatewayPort: apiGateway.port,
+      lanBind: config.lanBind || config.lanIp || detectIp(),
       autoStart,
       tailscaleAutoStart,
       access: {
@@ -591,6 +768,8 @@ export function apply(ctx, rawConfig) {
         funnelRequiresAuth,
         basicAuthUser,
         basicAuthConfigured: basicAuthHash.length > 0,
+        apiAccess,
+        apiMethods: API_METHOD_CATALOG,
       },
       caddy: { ...caddy, config: caddyConf, healthy: caddy.running ? await healthy() : false },
       cert: await certInfo(),
@@ -603,7 +782,7 @@ export function apply(ctx, rawConfig) {
 
   // ── ownership tracking for shutdown ─────────────────────────────────────
   // When dsh exits, we stop ONLY what this plugin brought up (or what is
-  // demonstrably the dsh-lan caddy — same Caddyfile path). A caddy the user
+  // demonstrably the dsh-remote-access caddy — same Caddyfile path). A caddy the user
   // started for something else, or a Tailscale session the user connected
   // themselves, is left alone.
   const weStartedTailscale = { v: false }
@@ -668,9 +847,9 @@ export function apply(ctx, rawConfig) {
     // pidfile may point to.
     const identity = await identifyCaddy(pid)
     if (!identity.ours) {
-      log.info(`[lan-manager] leaving foreign/unverified caddy alone (pid ${pid})`)
+      log.info(`[remote-access] leaving foreign/unverified caddy alone (pid ${pid})`)
       await fs.unlink(pidFile).catch(() => {})
-      return { ok: false, message: identity.foreign ? 'pidfile points to a caddy that is not dsh-lan; not stopping it' : 'cannot verify caddy identity; not stopping it' }
+      return { ok: false, message: identity.foreign ? 'pidfile points to a caddy that is not dsh-remote-access; not stopping it' : 'cannot verify caddy identity; not stopping it' }
     }
     return stopCaddyPid(pid)
   }
@@ -683,7 +862,7 @@ export function apply(ctx, rawConfig) {
     }
     const identity = await identifyCaddy(pid)
     if (!identity.ours) {
-      log.info(`[lan-manager] leaving foreign/unverified caddy alone (pid ${pid})`)
+      log.info(`[remote-access] leaving foreign/unverified caddy alone (pid ${pid})`)
       if (identity.foreign || identity.stale) await fs.unlink(pidFile).catch(() => {})
       return { ok: false, message: identity.foreign ? 'foreign caddy' : 'unverified caddy' }
     }
@@ -700,7 +879,7 @@ export function apply(ctx, rawConfig) {
     if (!alive(pid)) return
     const identity = identifyCaddySync(pid)
     if (!identity.ours) {
-      log.info(`[lan-manager] leaving foreign/unverified caddy alone (pid ${pid})`)
+      log.info(`[remote-access] leaving foreign/unverified caddy alone (pid ${pid})`)
       return
     }
     terminateProcess(pid, false)
@@ -710,16 +889,16 @@ export function apply(ctx, rawConfig) {
     try {
       const r = spawnSync('tailscale', args, { encoding: 'utf8', timeout: 3000 })
       if (r.error) {
-        log.warn(`[lan-manager] tailscale ${args[0]} failed: ${r.error.message}`)
+        log.warn(`[remote-access] tailscale ${args[0]} failed: ${r.error.message}`)
         return false
       }
       if (r.status !== 0) {
-        log.warn(`[lan-manager] tailscale ${args.join(' ')} exited ${r.status}: ${(r.stderr || '').trim()}`)
+        log.warn(`[remote-access] tailscale ${args.join(' ')} exited ${r.status}: ${(r.stderr || '').trim()}`)
         return false
       }
       return true
     } catch (e) {
-      log.warn(`[lan-manager] tailscale ${args[0]} failed: ${e.message}`)
+      log.warn(`[remote-access] tailscale ${args[0]} failed: ${e.message}`)
       return false
     }
   }
@@ -732,17 +911,17 @@ export function apply(ctx, rawConfig) {
     if (weEnabledFunnel.v) {
       const r = await exec('tailscale', ['serve', '--bg', '--https=443', String(config.tailscalePort)])
       if (r.ok) weEnabledFunnel.v = false
-      else log.warn(`[lan-manager] funnel off (restore serve-only) failed: ${r.message}`)
+      else log.warn(`[remote-access] funnel off (restore serve-only) failed: ${r.message}`)
     }
     if (weEnabledServe.v) {
       const r = await exec('tailscale', ['serve', 'off'])
       if (r.ok) weEnabledServe.v = false
-      else log.warn(`[lan-manager] serve off failed: ${r.message}`)
+      else log.warn(`[remote-access] serve off failed: ${r.message}`)
     }
     if (weStartedTailscale.v) {
       const r = await exec('tailscale', ['down'])
       if (r.ok) weStartedTailscale.v = false
-      else log.warn(`[lan-manager] tailscale down failed: ${r.message}`)
+      else log.warn(`[remote-access] tailscale down failed: ${r.message}`)
     }
   }
 
@@ -759,6 +938,7 @@ export function apply(ctx, rawConfig) {
     servicesShutdownStarted = true
     await stopOwnedCaddy()
     await stopOwnedTailscale()
+    await apiGateway.close()
   }
 
   function shutdownOwnedServicesSync() {
@@ -766,21 +946,28 @@ export function apply(ctx, rawConfig) {
     servicesShutdownStarted = true
     stopOwnedCaddySync()
     stopOwnedTailscaleSync()
+    apiGateway.closeSync()
   }
+
+  const caddyEnvironment = () => ({
+    DSH_CADDY_DIR: caddyDir,
+    DSH_PORT: String(config.port),
+    DSH_LOCAL_PORT: String(config.localPort),
+    DSH_TAILSCALE_PORT: String(config.tailscalePort),
+    DSH_API_GATEWAY_PORT: String(apiGateway.port),
+    DSH_LAN_BIND: String(config.lanBind || config.lanIp || detectIp()),
+    XDG_DATA_HOME: path.join(caddyDir, 'data'),
+    XDG_CONFIG_HOME: path.join(caddyDir, 'config'),
+  })
 
   function spawnCaddy() {
     return new Promise((resolve, reject) => {
-      const errFd = openSync(runLog, 'w')
+      const errFd = openSync(runLog, 'w', 0o600)
+      chmodSync(runLog, 0o600)
       const child = spawn(config.caddyBin, ['run', '--config', caddyConf, '--adapter', 'caddyfile'], {
         env: {
           ...process.env,
-          DSH_DEPLOY_DIR: deployDir,
-          DSH_CADDY_DIR: caddyDir,
-          DSH_PORT: String(config.port),
-          DSH_LOCAL_PORT: String(config.localPort),
-          DSH_TAILSCALE_PORT: String(config.tailscalePort),
-          XDG_DATA_HOME: path.join(caddyDir, 'data'),
-          XDG_CONFIG_HOME: path.join(caddyDir, 'config'),
+          ...caddyEnvironment(),
         },
         stdio: ['ignore', 'ignore', errFd],
         detached: false,
@@ -798,13 +985,49 @@ export function apply(ctx, rawConfig) {
     })
   }
 
+  async function ensureApiGateway() {
+    try {
+      await apiGateway.ready
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, code: 'api-gateway.unavailable', message: `API gateway unavailable: ${error.message}` }
+    }
+  }
+
+  const execGenCert = () => exec(process.execPath, [genCert], { DSH_LAN_IP: config.lanIp || detectIp(), DSH_CERT_DIR: path.join(caddyDir, 'certs') })
+
+  async function ensureCertificate() {
+    const info = await certInfo()
+    const nearExpiry = info.present && Number.isFinite(Date.parse(info.validTo)) && Date.parse(info.validTo) - Date.now() < 30 * 24 * 3600 * 1000
+    if (info.present && info.coversLanIp === true && !nearExpiry) return { ok: true, generated: false }
+
+    const generated = await execGenCert()
+    // gen-cert.js exits 10 after a successful regeneration so its caller can
+    // restart Caddy. Treat that exit code as success, then verify the files
+    // before allowing Caddy to validate the generated config.
+    if (!generated.ok && generated.code !== 10) {
+      return { ok: false, code: 'cert.generation-failed', message: generated.message || generated.output || 'failed to generate the local TLS certificate' }
+    }
+    const next = await certInfo()
+    if (!next.present || next.coversLanIp !== true) {
+      return { ok: false, code: 'cert.generation-failed', message: 'local TLS certificate was not generated for the configured LAN address' }
+    }
+    return { ok: true, generated: true }
+  }
+
   async function start() {
+    await settingsLoaded
+    const gateway = await ensureApiGateway()
+    if (!gateway.ok) return gateway
+    const expectedCaddyfile = buildCaddyfile()
+    const configMatches = await fs.readFile(caddyConf, 'utf8').then((text) => text === expectedCaddyfile).catch(() => false)
     const cur = await caddyRunning()
     if (cur.running) {
-      if (await healthy()) return { ok: true, alreadyRunning: true, pid: cur.pid }
+      if (configMatches && await healthy()) return { ok: true, alreadyRunning: true, pid: cur.pid }
       // The pidfile process is ours but not healthy (for example stuck in a
-      // graceful shutdown with a held connection). Stop it before spawning a
-      // replacement so two Caddy instances never fight over the ports.
+      // graceful shutdown with a held connection), or it is still using an
+      // older generated configuration. Stop it before spawning a replacement
+      // so two Caddy instances never fight over the ports.
       const identity = await identifyCaddy(cur.pid)
       if (!identity.ours) {
         if (await healthy()) {
@@ -824,9 +1047,16 @@ export function apply(ctx, rawConfig) {
       }
       if (!identity.ours) await fs.unlink(pidFile).catch(() => {})
     }
+    await writeCaddyfile()
     const probe = await exec(config.caddyBin, ['version'])
     if (!probe.ok) {
       return { ok: false, code: 'caddy.missing', message: `caddy binary not found: ${config.caddyBin}` }
+    }
+    const certificate = await ensureCertificate()
+    if (!certificate.ok) return certificate
+    const validation = await exec(config.caddyBin, ['validate', '--config', caddyConf, '--adapter', 'caddyfile'], caddyEnvironment())
+    if (!validation.ok) {
+      return { ok: false, code: 'caddy.invalid-config', message: validation.message || 'generated Caddyfile failed validation' }
     }
     let child
     try {
@@ -834,22 +1064,21 @@ export function apply(ctx, rawConfig) {
     } catch (e) {
       return { ok: false, message: `cannot spawn caddy: ${e.message}` }
     }
-    await fs.writeFile(pidFile, String(child.pid))
+    await atomicWrite(pidFile, String(child.pid))
     for (let i = 0; i < 40; i++) {
       if (await healthy()) return { ok: true, pid: child.pid }
       if (child.exitCode !== null) break
       await sleep(250)
     }
     const msg = `caddy did not become healthy within 10s; see ${runLog}`
-    log.warn(`[lan-manager] ${msg}`)
+    log.warn(`[remote-access] ${msg}`)
     return { ok: false, message: msg, exitCode: child.exitCode }
   }
 
-  const execGenCert = () => exec('bash', [genCert], { DSH_LAN_IP: config.lanIp || detectIp(), DSH_CERT_DIR: path.join(caddyDir, 'certs') })
-
   async function regenCert() {
+    if (!certSupported) return { ok: false, code: 'cert.unsupported', message: 'certificate generation is not supported on this platform' }
     const r = await execGenCert()
-    // gen-cert.sh exits 10 after regenerating (caller should restart caddy),
+    // gen-cert.js exits 10 after regenerating (caller should restart caddy),
     // so a non-zero exit here can still mean success.
     if (r.code === 10 || (r.ok && r.output.includes('cert regenerated'))) {
       await stop()
@@ -860,8 +1089,15 @@ export function apply(ctx, rawConfig) {
   }
 
   const tailscaleServeOn = (ts) => Array.isArray(ts.serve) && ts.serve.length > 0
+  let actionTail = Promise.resolve()
+  const runExclusive = (task) => {
+    const current = actionTail.then(task, task)
+    actionTail = current.catch(() => {})
+    return current
+  }
 
   async function action(body) {
+    await settingsLoaded
     switch (body && body.action) {
       case 'start': {
         const r = await start()
@@ -891,6 +1127,10 @@ export function apply(ctx, rawConfig) {
       case 'tailscaleDown': {
         const before = await tailscaleStatus()
         if (before.installed === false) return { ok: false, code: 'tailscale.missing', message: 'tailscale binary not found' }
+        if (before.running !== true) return { ok: true, alreadyOff: true, message: 'tailscale already disconnected' }
+        if (!weStartedTailscale.v) {
+          return { ok: false, code: 'tailscale.foreign', message: 'Tailscale was not started by dsh-remote-access; not disconnecting it' }
+        }
         const r = await exec('tailscale', ['down'])
         if (r.ok) weStartedTailscale.v = false
         return r.ok ? { ok: true, message: 'tailscale down' } : { ok: false, message: r.message }
@@ -899,24 +1139,32 @@ export function apply(ctx, rawConfig) {
         const on = body.funnelOn !== false
         const before = await tailscaleStatus()
         if (before.installed === false) return { ok: false, code: 'tailscale.missing', message: 'tailscale binary not found' }
+        if (before.funnelState === 'unknown') {
+          return { ok: false, code: 'funnel.status-unknown', message: 'cannot verify the current Funnel state; not modifying Tailscale configuration' }
+        }
         if (on && funnelRequiresAuth && !basicAuthHash) {
           return { ok: false, code: 'auth.missing', message: 'generate Basic Auth credentials before enabling Funnel' }
         }
-        if (on && before.funnelOn === true) return { ok: true, alreadyOn: true, message: 'funnel already on' }
+        const expectedServeTarget = `http://127.0.0.1:${config.tailscalePort}`
+        if (on && before.funnelOn === true) {
+          if (!weEnabledFunnel.v && before.serveTarget !== expectedServeTarget) {
+            return { ok: false, code: 'funnel.foreign', message: `existing Funnel target ${before.serveTarget || 'unknown'} is not managed by dsh-remote-access; not modifying it` }
+          }
+          return { ok: true, alreadyOn: true, message: 'funnel already on' }
+        }
         // Enabling Funnel rewrites the shared Serve config. Allow it when Serve
         // is already managed by this plugin, when there is no Serve yet, or
-        // when the existing Serve is exactly the standard dsh-lan route into
+        // when the existing Serve is exactly the standard dsh-remote-access route into
         // Caddy (http://127.0.0.1:<tailscalePort>). Any other pre-existing
         // Serve configuration is left untouched.
-        const expectedServeTarget = `http://127.0.0.1:${config.tailscalePort}`
         if (on && before.serve !== 'off' && !weEnabledServe.v && before.serveTarget !== expectedServeTarget) {
-          return { ok: false, code: 'serve.foreign', message: `existing Serve target ${before.serveTarget || 'unknown'} is not managed by dsh-lan; not modifying it` }
+          return { ok: false, code: 'serve.foreign', message: `existing Serve target ${before.serveTarget || 'unknown'} is not managed by dsh-remote-access; not modifying it` }
         }
         // If Funnel is already off there is nothing to do; never touch a
         // Funnel that was enabled outside this plugin.
         if (!on && before.funnelOn !== true) return { ok: true, alreadyOff: true, message: 'funnel already off' }
-        if (!on && !weEnabledFunnel.v) {
-          return { ok: false, code: 'funnel.foreign', message: 'funnel was not enabled by dsh-lan; not changing it' }
+        if (!on && !weEnabledFunnel.v && before.serveTarget !== expectedServeTarget) {
+          return { ok: false, code: 'funnel.foreign', message: 'funnel was not enabled by dsh-remote-access; not changing it' }
         }
         // Funnel is a mode of the shared Serve config. Turning it OFF must
         // recreate a tailnet-only Serve route rather than `funnel off/reset`,
@@ -938,7 +1186,20 @@ export function apply(ctx, rawConfig) {
         const before = await tailscaleStatus()
         if (before.installed === false) return { ok: false, code: 'tailscale.missing', message: 'tailscale binary not found' }
         const beforeOn = tailscaleServeOn(before)
-        if (on && beforeOn === true) return { ok: true, alreadyOn: true, message: 'tailscale serve already on' }
+        const expectedServeTarget = `http://127.0.0.1:${config.tailscalePort}`
+        if (on && before.serve === 'unknown') {
+          return { ok: false, code: 'serve.foreign', message: 'existing Serve state could not be verified; not modifying it' }
+        }
+        if (on && beforeOn === true) {
+          if (before.serveTarget !== expectedServeTarget) {
+            return { ok: false, code: 'serve.foreign', message: `existing Serve target ${before.serveTarget || 'unknown'} is not managed by dsh-remote-access; not modifying it` }
+          }
+          return { ok: true, alreadyOn: true, message: 'tailscale serve already on' }
+        }
+        if (!on && beforeOn === false) return { ok: true, alreadyOff: true, message: 'tailscale serve already off' }
+        if (!on && !weEnabledServe.v && before.serveTarget !== expectedServeTarget) {
+          return { ok: false, code: 'serve.foreign', message: `existing Serve target ${before.serveTarget || 'unknown'} is not managed by dsh-remote-access; not modifying it` }
+        }
         const r = on
           ? await exec('tailscale', ['serve', '--bg', '--https=443', String(config.tailscalePort)])
           : await exec('tailscale', ['serve', 'off'])
@@ -954,11 +1215,16 @@ export function apply(ctx, rawConfig) {
         }
       }
       case 'setCertNotice': {
+        if (body.on === true && !mdnsSupported) {
+          return { ok: false, code: 'mdns.unsupported', message: 'mDNS detection is not supported on this platform' }
+        }
         noticeState.enabled = body.on === true
-        if (body.probeHost) noticeState.probeHost = String(body.probeHost)
-        await fs
-          .mkdir(caddyDir, { recursive: true })
-          .then(() => fs.writeFile(noticeStateFile, JSON.stringify(noticeState, null, 2)))
+        if (body.probeHost) {
+          const probeHost = validProbeHost(body.probeHost)
+          if (!probeHost) return { ok: false, code: 'probe.invalid-host', message: 'probeHost must be a hostname or IPv4 address' }
+          noticeState.probeHost = probeHost
+        }
+        await atomicWrite(noticeStateFile, JSON.stringify(noticeState, null, 2) + '\n')
         applyNoticeTap()
         return { ok: true, message: `证书安装提示已${noticeState.enabled ? '开启' : '关闭'}` }
       }
@@ -973,20 +1239,61 @@ export function apply(ctx, rawConfig) {
         return { ok: true, message: `Tailscale 自启动已${tailscaleAutoStart ? '开启' : '关闭'}(下次启动 dsh 生效)` }
       }
       case 'setLanAuth': {
+        if (body.on === true && !basicAuthHash) return { ok: false, code: 'auth.missing', message: 'generate Basic Auth credentials before enabling LAN Auth' }
         lanAuth = body.on === true
         await persistRuntimeSettings()
         const applied = await applyCaddyfile()
         return { ok: applied.ok, message: applied.message }
       }
       case 'setServeAuth': {
+        if (body.on === true && !basicAuthHash) return { ok: false, code: 'auth.missing', message: 'generate Basic Auth credentials before enabling Serve Auth' }
         serveAuth = body.on === true
         await persistRuntimeSettings()
         const applied = await applyCaddyfile()
         return { ok: applied.ok, message: applied.message }
       }
+      case 'setApiAccess': {
+        const mode = typeof body.mode === 'string' ? body.mode : ''
+        if (!ACCESS_MODES.includes(mode)) {
+          return { ok: false, code: 'api-access.invalid-mode', message: `unknown API access mode: ${mode || '(missing)'}` }
+        }
+        if (!Array.isArray(body.allow)) {
+          return { ok: false, code: 'api-access.invalid-list', message: 'allow must be an array of known API methods' }
+        }
+        const allow = [...new Set(body.allow.filter((method) => typeof method === 'string' && method.length > 0))]
+        const unknown = allow.filter((method) => method !== '*' && !isKnownApiMethod(method))
+        if (unknown.length > 0) {
+          return { ok: false, code: 'api-access.unknown-method', message: `unknown API method: ${unknown.join(', ')}` }
+        }
+        const current = apiAccess[mode] || { allow: [], events: true }
+        const events = typeof body.events === 'boolean' ? body.events : current.events === true
+        const allApis = typeof body.allApis === 'boolean' ? body.allApis : current.allApis === true
+        const trustedRemoteSettings = typeof body.trustedRemoteSettings === 'boolean'
+          ? body.trustedRemoteSettings
+          : current.trustedRemoteSettings === true
+        if (mode === 'funnel' && (allApis || trustedRemoteSettings)) {
+          return { ok: false, code: 'api-access.funnel-restricted', message: 'Funnel does not support all APIs or trusted remote settings' }
+        }
+        if (mode === 'funnel') {
+          const privileged = allow.filter((method) => isPrivilegedApiMethod(method))
+          if (privileged.length > 0) {
+            return { ok: false, code: 'api-access.funnel-restricted', message: `Funnel cannot expose privileged API methods: ${privileged.join(', ')}` }
+          }
+        }
+        const next = {
+          ...apiAccess,
+          [mode]: { allow, events, allApis, trustedRemoteSettings },
+        }
+        apiAccess = normalizeApiAccessPolicy(next)
+        await persistRuntimeSettings()
+        apiGateway.setPolicy(apiAccess)
+        return { ok: true, mode, policy: apiAccess[mode], message: `${mode} API access policy updated` }
+      }
       case 'resetBasicAuth': {
         const password = randomBytes(12).toString('base64url')
-        const hashed = await exec(config.caddyBin, ['hash-password', '--plaintext', password])
+        // Let Caddy read the secret from stdin so it never appears in argv or
+        // the process list of another local user.
+        const hashed = await exec(config.caddyBin, ['hash-password'], undefined, `${password}\n`)
         if (!hashed.ok) {
           return { ok: false, code: hashed.code === 'ENOENT' ? 'caddy.missing' : undefined, message: hashed.message }
         }
@@ -1001,21 +1308,19 @@ export function apply(ctx, rawConfig) {
         }
       }
       case 'autoConfig': {
-        // One-click bring-up: verify binary, cert, Caddyfile template, then
-        // start the proxy.
+        // One-click bring-up: verify the binary and certificate, write the
+        // current Caddy configuration, then start the proxy.
         const steps = []
         const caddyProbe = await exec(config.caddyBin, ['version'])
         if (!caddyProbe.ok) {
           return { ok: false, code: 'caddy.missing', message: `caddy binary not found: ${config.caddyBin}`, steps }
         }
-        const info = await certInfo()
-        const nearExpiry = info.present && Number.isFinite(Date.parse(info.validTo)) && Date.parse(info.validTo) - Date.now() < 30 * 24 * 3600 * 1000
-        if (!info.present || info.coversLanIp !== true || nearExpiry) {
-          const g = await execGenCert()
-          // gen-cert.sh exits 10 after regenerating; that is still success.
-          if (g.ok || g.code === 10) steps.push(g.ok ? 'cert up to date' : 'cert generated')
-          else steps.push(`cert generation failed: ${g.message}`)
+        const certificate = await ensureCertificate()
+        if (!certificate.ok) {
+          steps.push(`cert generation failed: ${certificate.message}`)
+          return { ok: false, code: certificate.code, steps, message: certificate.message }
         }
+        steps.push(certificate.generated ? 'cert generated' : 'cert up to date')
         const confOk = await fs
           .access(caddyConf)
           .then(() => true)
@@ -1108,7 +1413,7 @@ export function apply(ctx, rawConfig) {
 
   const noticeState = {
     enabled: config.certNotice,
-    probeHost: config.probeHost || `${os.hostname()}.local`,
+    probeHost: validProbeHost(config.probeHost) || validProbeHost(`${os.hostname()}.local`) || 'localhost',
     probePort: config.probePort,
   }
   let tapDispose = null
@@ -1119,7 +1424,7 @@ export function apply(ctx, rawConfig) {
       tapDispose = null
     }
     if (!noticeState.enabled) return
-    const script = BANNER.replace('%PROBE_HOST%', JSON.stringify(noticeState.probeHost)).replace(
+    const script = BANNER.replace('%PROBE_HOST%', scriptString(noticeState.probeHost)).replace(
       '%PROBE_PORT%',
       String(noticeState.probePort),
     )
@@ -1136,7 +1441,7 @@ export function apply(ctx, rawConfig) {
     try {
       const saved = JSON.parse(await fs.readFile(noticeStateFile, 'utf8'))
       if (typeof saved.enabled === 'boolean') noticeState.enabled = saved.enabled
-      if (typeof saved.probeHost === 'string' && saved.probeHost) noticeState.probeHost = saved.probeHost
+      if (typeof saved.probeHost === 'string' && validProbeHost(saved.probeHost)) noticeState.probeHost = validProbeHost(saved.probeHost)
     } catch {
       /* first run: keep config default */
     }
@@ -1148,8 +1453,27 @@ export function apply(ctx, rawConfig) {
   // routes so no handler can observe it uninitialized.
   const actionToken = randomBytes(24).toString('hex')
   const tokenTap = ctx.webServer.tapIndex((html) => {
-    if (html.includes('name="dsh-lan-token"')) return html
-    return html.replace('</head>', `<meta name="dsh-lan-token" content="${actionToken}">\n</head>`)
+    if (html.includes('name="dsh-remote-access-token"')) return html
+    return html.replace('</head>', `<meta name="dsh-remote-access-token" content="${actionToken}">\n</head>`)
+  })
+  const capabilityTap = ctx.webServer.tapIndex((html) => {
+    if (html.includes('name="dsh-remote-access-capabilities"')) return html
+    // Base64 keeps the meta attribute independent of JSON quoting and does
+    // not carry a secret. The server-side API gateway still decides whether a
+    // request is actually allowed.
+    let capabilityAccess = apiAccess
+    try {
+      const saved = JSON.parse(readFileSync(stateFile, 'utf8'))
+      if (saved && saved.apiAccess !== undefined) capabilityAccess = normalizeApiAccessPolicy(saved.apiAccess)
+    } catch {
+      /* The in-memory policy is the source of truth until the first state write. */
+    }
+    const capabilities = Buffer.from(JSON.stringify({
+      lan: { trustedRemoteSettings: capabilityAccess.lan?.trustedRemoteSettings === true },
+      serve: { trustedRemoteSettings: capabilityAccess.serve?.trustedRemoteSettings === true },
+      funnel: { trustedRemoteSettings: false },
+    })).toString('base64')
+    return html.replace('</head>', `<meta name="dsh-remote-access-capabilities" content="${capabilities}">\n</head>`)
   })
 
   // ── HTTP surface ─────────────────────────────────────────────────────────
@@ -1194,33 +1518,46 @@ export function apply(ctx, rawConfig) {
   disposers.push(
     ctx.webServer.register({
       kind: 'exact',
-      path: '/lan.status.json',
+      path: '/remote-access.status.json',
       handler: async (req, res) => {
         if (req.method !== 'GET') {
           sendJson(res, 405, { ok: false, message: 'GET only' })
           return
         }
-        sendJson(res, 200, await status())
+        const snapshot = await status()
+        snapshot.remoteAccessMode = typeof req.headers['x-dsh-remote-access-mode'] === 'string'
+          ? req.headers['x-dsh-remote-access-mode']
+          : ''
+        snapshot.managementLocal = !snapshot.remoteAccessMode
+        sendJson(res, 200, snapshot)
       },
     }),
   )
   disposers.push(
     ctx.webServer.register({
       kind: 'exact',
-      path: '/lan.action',
+      path: '/remote-access.action',
       handler: async (req, res) => {
         if (req.method !== 'POST') {
           sendJson(res, 405, { ok: false, message: 'POST only' })
           return
         }
+        // Caddy marks every remote non-/api request. This management surface
+        // can stop Caddy, change Tailscale state, or mint credentials, so it
+        // stays local-only by default even though ordinary DSH UI requests
+        // are available remotely through the basic API policy.
+        if (req.headers['x-dsh-remote-access-mode']) {
+          sendJson(res, 403, { ok: false, code: 'remote-access.local-only', message: 'remote-access actions are available only on the local DSH URL' })
+          return
+        }
         // Mutating surface is gated by the per-boot token injected into the
-        // served index.html — the settings page carries it automatically;
-        // anonymous LAN POSTs get 401.
-        const presented = Buffer.from(String(req.headers['x-lan-token'] || ''))
+        // served index.html — the local settings page carries it automatically;
+        // local requests without it get 401.
+        const presented = Buffer.from(String(req.headers['x-remote-access-token'] || ''))
         const expected = Buffer.from(actionToken)
         const authorized = presented.length === expected.length && timingSafeEqual(presented, expected)
         if (!authorized) {
-          sendJson(res, 401, { ok: false, message: 'unauthorized: missing or stale X-Lan-Token (refresh the dsh page)' })
+          sendJson(res, 401, { ok: false, message: 'unauthorized: missing or stale X-Remote-Access-Token (refresh the dsh page)' })
           return
         }
         const body = await readBody(req)
@@ -1230,13 +1567,13 @@ export function apply(ctx, rawConfig) {
         }
         let out
         try {
-          out = await action(body)
+          out = await runExclusive(() => action(body))
         } catch (e) {
           out = { ok: false, message: `action error: ${e.message}` }
         }
         // Do not embed a full status snapshot here: status probes (caddy
         // health + several tailscale CLI calls) make the action response feel
-        // slow. The client refreshes /lan.status.json itself right after.
+        // slow. The client refreshes /remote-access.status.json itself right after.
         sendJson(res, out.ok ? 200 : 400, out)
       },
     }),
@@ -1250,26 +1587,26 @@ export function apply(ctx, rawConfig) {
       const jobs = []
       if (autoStart) {
         jobs.push(
-          start().then((r) =>
-            log.info(`[lan-manager] auto-start(caddy) => ${r.ok ? 'ok' : 'failed'} pid=${r.pid || 0} msg=${r.message || ''}`),
+          runExclusive(() => start()).then((r) =>
+            log.info(`[remote-access] auto-start(caddy) => ${r.ok ? 'ok' : 'failed'} pid=${r.pid || 0} msg=${r.message || ''}`),
           ),
         )
       }
       if (config.tailscale && tailscaleAutoStart) {
         jobs.push(
-          (async () => {
+          runExclusive(async () => {
             const ts = await tailscaleStatus()
             if (ts.running === true) return
             const r = await exec('tailscale', ['up', '--operator=' + os.userInfo().username])
             if (r.ok && ts.running === false) weStartedTailscale.v = true
-            log.info(`[lan-manager] auto-start(tailscale) => ${r.ok ? 'ok' : 'failed'} ${r.message || ''}`)
-          })(),
+            log.info(`[remote-access] auto-start(tailscale) => ${r.ok ? 'ok' : 'failed'} ${r.message || ''}`)
+          }),
         )
       }
-      for (const p of jobs) p.catch((e) => log.warn(`[lan-manager] auto-start error: ${e.message}`))
+      for (const p of jobs) p.catch((e) => log.warn(`[remote-access] auto-start error: ${e.message}`))
     })()
   }, 750)
-  log.info(`[lan-manager] active deployDir=${deployDir} port=${config.port}`)
+  log.info(`[remote-access] active deployDir=${deployDir} port=${config.port}`)
 
   // Cordis disposal is normally invoked by dsh, but if an earlier disposer
   // hangs/throws (or the process is force-exited) the plugin disposer may
@@ -1300,6 +1637,13 @@ export function apply(ctx, rawConfig) {
         /* best effort */
       }
     }
+    if (capabilityTap) {
+      try {
+        capabilityTap()
+      } catch {
+        /* best effort */
+      }
+    }
     for (const d of disposers) {
       try {
         d()
@@ -1314,6 +1658,7 @@ export function apply(ctx, rawConfig) {
         /* best effort */
       }
     }
+    await actionTail.catch(() => {})
     await shutdownOwnedServices()
   }
 }

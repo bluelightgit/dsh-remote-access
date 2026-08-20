@@ -1,14 +1,15 @@
-# dsh-lan-manager bundle patch.
+# dsh-remote-access bundle patch.
 #
 # When installed through the official DSH CLI/market, this row mounts the
 # host plugin automatically. A manual mount with the same id should be
 # removed from the profile's cordis.patch.yml to avoid double-mounting.
 - insert:
-    - id: lan-manager
-      name: dsh-lan-manager
+    - id: remote-access
+      name: dsh-remote-access
       config:
         port: 3081
         localPort: 3080
         tailscalePort: 3082
+        apiGatewayPort: 3083
         tailscale: true
         certNotice: false

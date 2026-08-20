@@ -1,9 +1,12 @@
 {
-  "name": "dsh-lan-manager",
+  "name": "dsh-remote-access",
   "version": "0.1.0",
-  "description": "DSH web plugin: LAN / Tailscale exposure with native Caddy reverse proxy, local CA, optional Basic Auth, and a settings-page control panel.",
+  "description": "DSH web plugin for LAN and Tailscale remote access through Caddy with API access policies.",
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client/client.js",
@@ -24,10 +27,10 @@
   "files": [
     "LICENSE",
     "README.md",
-    "caddy/Caddyfile",
+    "api-gateway.js",
     "client/client.js",
     "cordis.patch.yml",
-    "gen-cert.sh",
+    "gen-cert.js",
     "index.js",
     "install.js"
   ],
