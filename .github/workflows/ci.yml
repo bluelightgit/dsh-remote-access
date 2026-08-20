@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Node ${{ matrix.node-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20.x, 22.x, 24.x]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Run tests
+        run: npm test
+
+      - name: Check JavaScript syntax
+        run: |
+          node --check index.js
+          node --check api-gateway.js
+          node --check client/client.js
+          node --check gen-cert.js
+          node --check install.js
+
+  package:
+    name: Validate npm package
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - name: Check package contents
+        run: |
+          npm pack --dry-run --json > pack.json
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs'
+
+          const result = JSON.parse(readFileSync('pack.json', 'utf8'))[0]
+          if (result.name !== 'dsh-remote-access') throw new Error(`unexpected package: ${result.name}`)
+          if (!result.files.some(({ path }) => path === 'index.js')) throw new Error('index.js is missing from the package')
+          if (!result.files.some(({ path }) => path === 'client/client.js')) throw new Error('client/client.js is missing from the package')
+          if (result.files.some(({ path }) => path.startsWith('test/'))) throw new Error('tests must not be published')
+          NODE
