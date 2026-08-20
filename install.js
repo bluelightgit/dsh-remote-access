@@ -10,7 +10,8 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)))
-const packageName = 'dsh-remote-access'
+const packageName = '@greenonion/dsh-remote-access'
+const pluginDirName = 'dsh-remote-access'
 const dshHome = process.env.DSH_HOME && process.env.DSH_HOME.trim() ? path.resolve(process.env.DSH_HOME) : path.join(os.homedir(), '.dsh')
 const profile = path.resolve(process.env.DSH_PROFILE_DIR || path.join(dshHome, 'profiles', 'web'))
 const log = (msg) => console.log(`[install] ${msg}`)
@@ -22,7 +23,7 @@ if (!existsSync(profile)) {
 }
 
 const pluginsDir = path.join(profile, 'plugins')
-const link = path.join(pluginsDir, packageName)
+const link = path.join(pluginsDir, pluginDirName)
 mkdirSync(pluginsDir, { recursive: true })
 try {
   symlinkSync(repo, link, process.platform === 'win32' ? 'junction' : 'dir')
@@ -43,7 +44,7 @@ const manifest = JSON.parse(readFileSync(profileManifest, 'utf8'))
 manifest.dependencies ??= {}
 // Keep the development install live: a `file:` dependency is materialized
 // into node_modules by pnpm and can leave DSH loading an older client bundle.
-manifest.dependencies[packageName] = `link:./plugins/${packageName}`
+manifest.dependencies[packageName] = `link:./plugins/${pluginDirName}`
 const bundles = manifest.dsh?.profile?.bundles
 if (Array.isArray(bundles) && !bundles.includes(packageName)) bundles.push(packageName)
 writeFileSync(profileManifest, `${JSON.stringify(manifest, null, 2)}\n`)
@@ -56,8 +57,8 @@ log('updated profile package.json')
 // cleanup instead.
 const patchFile = path.join(profile, 'cordis.patch.yml')
 const patchText = existsSync(patchFile) ? readFileSync(patchFile, 'utf8') : ''
-if (patchText.includes('name: dsh-remote-access') || patchText.includes('id: remote-access')) {
-  log('warning: profile cordis.patch.yml already contains dsh-remote-access; remove that row because the package bundle patch owns it')
+if (patchText.includes('id: remote-access')) {
+  log('warning: profile cordis.patch.yml already contains remote-access; remove that row because the package bundle patch owns it')
 } else {
   log('profile cordis.patch.yml unchanged; package bundle patch owns remote-access')
 }

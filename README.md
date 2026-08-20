@@ -30,7 +30,7 @@ LAN、Serve、Funnel 各自使用 API 白名单，默认只开放会话、消息
 ## 安装
 
 ```bash
-dsh plugin --profile web add dsh-remote-access
+dsh plugin --profile web add @greenonion/dsh-remote-access
 ```
 
 手动安装：

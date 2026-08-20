@@ -64,7 +64,7 @@ jobs:
           import { readFileSync } from 'node:fs'
 
           const result = JSON.parse(readFileSync('pack.json', 'utf8'))[0]
-          if (result.name !== 'dsh-remote-access') throw new Error(`unexpected package: ${result.name}`)
+          if (result.name !== '@greenonion/dsh-remote-access') throw new Error(`unexpected package: ${result.name}`)
           if (!result.files.some(({ path }) => path === 'index.js')) throw new Error('index.js is missing from the package')
           if (!result.files.some(({ path }) => path === 'client/client.js')) throw new Error('client/client.js is missing from the package')
           if (result.files.some(({ path }) => path.startsWith('test/'))) throw new Error('tests must not be published')
